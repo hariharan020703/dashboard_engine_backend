@@ -1,0 +1,340 @@
+{
+  "version": "15",
+  "id": "cinema-analytics",
+  "title": "Cinema Analytics Dashboard",
+  "description": "Booking & Revenue Insights",
+  "dataSource": {
+    "type": "mysql",
+    "database": "sales_analysis",
+    "table": "dashboard",
+    "dateParse": {
+      "Booking Date": "%b %d, %Y"
+    }
+  },
+  "dataset": "dashboard",
+  "layout": {
+    "cols": 12,
+    "gap": "md",
+    "kpi": {
+      "span": 3,
+      "minHeight": 130
+    },
+    "chart": {
+      "span": 6,
+      "minHeight": 360
+    },
+    "slicer": {
+      "span": 3,
+      "minHeight": 44
+    }
+  },
+  "slicers": [
+    {
+      "id": "sGenre",
+      "title": "Genre",
+      "column": "Genre",
+      "type": "multi",
+      "span": 3,
+      "showCount": true
+    },
+    {
+      "id": "sTheater",
+      "title": "Theater",
+      "column": "Theater Name",
+      "type": "multi",
+      "span": 3,
+      "showCount": true
+    },
+    {
+      "id": "sStatus",
+      "title": "Status",
+      "column": "Status",
+      "type": "single",
+      "span": 3,
+      "showCount": true
+    },
+    {
+      "id": "sBookingType",
+      "title": "Booking Type",
+      "column": "Booking Type",
+      "type": "single",
+      "span": 3,
+      "showCount": true
+    }
+  ],
+  "kpis": [
+    {
+      "id": "totalRevenue",
+      "chartType": "badge_multi_value",
+      "title": "Total Revenue USD",
+      "series": {
+        "main": {
+          "columns": [
+            {
+              "column": "Revenue",
+              "mapping": "VALUE",
+              "aggregation": "SUM",
+              "format": {
+                "type": "abbreviated",
+                "format": "#A",
+                "prefix": "$",
+                "suffix": " USD"
+              }
+            }
+          ],
+          "dateGrain": {
+            "column": "Booking Date",
+            "dateTimeElement": "MONTH"
+          }
+        }
+      },
+      "comparison": {
+        "label": "vs last month",
+        "deltaFormat": {
+          "type": "percent",
+          "suffix": "%",
+          "digits": 1
+        }
+      },
+      "layout": {
+        "span": 3
+      }
+    },
+    {
+      "id": "totalBookings",
+      "chartType": "badge_multi_value",
+      "title": "Total Bookings",
+      "series": {
+        "main": {
+          "columns": [
+            {
+              "column": "Booking Id",
+              "mapping": "VALUE",
+              "aggregation": "COUNTDISTINCT"
+            }
+          ],
+          "dateGrain": {
+            "column": "Booking Date",
+            "dateTimeElement": "MONTH"
+          }
+        }
+      },
+      "comparison": {
+        "label": "vs last month",
+        "deltaFormat": {
+          "type": "percent",
+          "suffix": "%",
+          "digits": 1
+        }
+      },
+      "layout": {
+        "span": 3
+      }
+    },
+    {
+      "id": "avgRating",
+      "chartType": "badge_multi_value",
+      "title": "Avg Movie Rating",
+      "series": {
+        "main": {
+          "columns": [
+            {
+              "column": "AVG RATING",
+              "mapping": "VALUE",
+              "aggregation": "AVERAGE",
+              "format": {
+                "type": "number",
+                "digits": 1,
+                "suffix": " / 10"
+              }
+            }
+          ],
+          "dateGrain": {
+            "column": "Booking Date",
+            "dateTimeElement": "MONTH"
+          }
+        }
+      },
+      "comparison": {
+        "label": "vs last month",
+        "deltaFormat": {
+          "type": "percent",
+          "suffix": "%",
+          "digits": 1
+        }
+      },
+      "layout": {
+        "span": 3
+      }
+    },
+    {
+      "id": "avgOccupancy",
+      "chartType": "badge_multi_value",
+      "title": "Avg Occupancy Rate",
+      "series": {
+        "main": {
+          "columns": [
+            {
+              "column": "OCCUPANCY RATE",
+              "mapping": "VALUE",
+              "aggregation": "AVERAGE",
+              "format": {
+                "type": "percent",
+                "suffix": "%",
+                "digits": 1
+              }
+            }
+          ],
+          "dateGrain": {
+            "column": "Booking Date",
+            "dateTimeElement": "MONTH"
+          }
+        }
+      },
+      "comparison": {
+        "label": "vs last month",
+        "deltaFormat": {
+          "type": "percent",
+          "suffix": "%",
+          "digits": 1
+        }
+      },
+      "layout": {
+        "span": 3
+      }
+    }
+  ],
+  "cards": [
+    {
+      "id": "revenueByMovie",
+      "chartType": "line_bar_combo",
+      "title": "Revenue vs Profit by Movie",
+      "description": "Bars: Revenue (left axis), Line: Profit (right axis)",
+      "columns": [
+        {
+          "column": "Movie Name",
+          "mapping": "XTIME"
+        },
+        {
+          "column": "Revenue",
+          "aggregation": "SUM",
+          "mapping": "VALUE"
+        },
+        {
+          "column": "Profit",
+          "aggregation": "SUM",
+          "mapping": "VALUE"
+        }
+      ],
+      "groupBy": [
+        {
+          "column": "Movie Name"
+        }
+      ],
+      "options": {
+        "dualAxis": true,
+        "colorMapping": {
+          "Revenue": "#3b82f6",
+          "Profit": "#10b981"
+        }
+      },
+      "layout": {
+        "span": 12
+      },
+      "limits": 5
+    },
+    {
+      "id": "genreTreemap",
+      "chartType": "treemap",
+      "title": "Revenue by Genre (Treemap)",
+      "description": "Hierarchical rectangle size encodes revenue per genre",
+      "columns": [
+        {
+          "column": "Genre",
+          "mapping": "SERIES"
+        },
+        {
+          "column": "Revenue",
+          "aggregation": "SUM",
+          "mapping": "VALUE"
+        }
+      ],
+      "groupBy": [
+        {
+          "column": "Genre"
+        }
+      ],
+      "layout": {
+        "span": 6
+      }
+    },
+    {
+      "id": "bookingFunnel",
+      "chartType": "funnel",
+      "title": "Revenue by Theater (Funnel)",
+      "description": "Theater revenue ranked largest to smallest",
+      "columns": [
+        {
+          "column": "Theater Name",
+          "mapping": "SERIES"
+        },
+        {
+          "column": "Revenue",
+          "aggregation": "SUM",
+          "mapping": "VALUE"
+        }
+      ],
+      "groupBy": [
+        {
+          "column": "Theater Name"
+        }
+      ],
+      "layout": {
+        "span": 6
+      },
+      "limits": 5
+    },
+    {
+      "id": "revenueByGenre",
+      "chartType": "stacked_area",
+      "title": "Revenue by Genre (Stacked Area)",
+      "description": "Stacked revenue contribution by movie, colored by genre",
+      "columns": [
+        {
+          "column": "Movie Name",
+          "mapping": "XTIME"
+        },
+        {
+          "column": "Revenue",
+          "aggregation": "SUM",
+          "mapping": "VALUE"
+        },
+        {
+          "column": "Genre",
+          "mapping": "SERIES"
+        }
+      ],
+      "groupBy": [
+        {
+          "column": "Movie Name"
+        },
+        {
+          "column": "Genre"
+        }
+      ],
+      "options": {
+        "stacked": true,
+        "gradient": true,
+        "colorMapping": {
+          "Comedy": "#f59e0b",
+          "Drama": "#ef4444",
+          "Action": "#3b82f6",
+          "Sci-Fi": "#10b981"
+        }
+      },
+      "layout": {
+        "span": 12
+      }
+    }
+  ]
+}
