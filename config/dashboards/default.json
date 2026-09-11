@@ -11,10 +11,9 @@
       "Booking Date": "%b %d, %Y"
     }
   },
-  "dataset": "dashboard",
   "layout": {
     "cols": 12,
-    "gap": "md",
+    "gap": "sm",
     "kpi": {
       "span": 3,
       "minHeight": 130
@@ -209,7 +208,7 @@
       "id": "revenueByMovie",
       "chartType": "line_bar_combo",
       "title": "Revenue vs Profit by Movie",
-      "description": "Bars: Revenue (left axis), Line: Profit (right axis)",
+      "description": "",
       "columns": [
         {
           "column": "Movie Name",
@@ -224,6 +223,11 @@
           "column": "Profit",
           "aggregation": "SUM",
           "mapping": "VALUE"
+        },
+        {
+          "column": "TOTAL BOOKED",
+          "mapping": "VALUE",
+          "aggregation": "SUM"
         }
       ],
       "groupBy": [
@@ -241,13 +245,14 @@
       "layout": {
         "span": 12
       },
-      "limits": 5
+      "limits": 5,
+      "format": {}
     },
     {
       "id": "genreTreemap",
       "chartType": "treemap",
-      "title": "Revenue by Genre (Treemap)",
-      "description": "Hierarchical rectangle size encodes revenue per genre",
+      "title": "Revenue by Genre",
+      "description": "",
       "columns": [
         {
           "column": "Genre",
@@ -271,8 +276,8 @@
     {
       "id": "bookingFunnel",
       "chartType": "funnel",
-      "title": "Revenue by Theater (Funnel)",
-      "description": "Theater revenue ranked largest to smallest",
+      "title": "Revenue by Theater",
+      "description": "",
       "columns": [
         {
           "column": "Theater Name",
@@ -291,14 +296,13 @@
       ],
       "layout": {
         "span": 6
-      },
-      "limits": 5
+      }
     },
     {
       "id": "revenueByGenre",
       "chartType": "stacked_area",
-      "title": "Revenue by Genre (Stacked Area)",
-      "description": "Stacked revenue contribution by movie, colored by genre",
+      "title": "Revenue by Genre",
+      "description": "",
       "columns": [
         {
           "column": "Movie Name",

@@ -37,7 +37,14 @@ const OPERATORS = {
   BETWEEN: 'BETWEEN',
 };
 
-const SORT_DIRECTIONS = { ASC: 'ASC', DESC: 'DESC' };
+// Aliases, in the same spirit as AGGREGATIONS: callers may spell a direction
+// either way and the SQL keyword is the same.
+const SORT_DIRECTIONS = {
+  ASC: 'ASC',
+  ASCENDING: 'ASC',
+  DESC: 'DESC',
+  DESCENDING: 'DESC',
+};
 
 const MONTH_NAMES = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
