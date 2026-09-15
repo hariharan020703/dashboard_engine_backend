@@ -1,13 +1,16 @@
 const express = require('express');
 const { getSpec, invalidateSpecCache, hydrateView } = require('../../dashboard/dashboardService');
 const registry = require('../../dashboard/dashboardRegistry');
+const { flattenCard } = require('../../dashboard/cardModel');
 const { sendError, badRequest } = require('../httpError');
 const { elapsed } = require('../middleware/requestTimer');
 
 /**
  * Two operations, each available for the default dashboard (the paths the
  * frontend uses) and for an explicit dashboard id:
- *   read a hydrated dashboard, and replace one card or KPI in it.
+ *   read a hydrated dashboard, and replace one card in it. KPIs are cards —
+ *   a card's chartType is what makes it a badge rather than a chart — so a
+ *   single index addresses everything on the dashboard.
  */
 const router = express.Router();
 
@@ -28,15 +31,15 @@ async function respondWithView(req, res, label) {
 }
 
 function applyCardPatch(spec, body) {
-  const { kind, index, card } = body || {};
+  const { index, card } = body || {};
   if (!card || typeof index !== 'number') {
-    throw badRequest('expected { kind, index, card }');
+    throw badRequest('expected { index, card }');
   }
-  const list = kind === 'kpi' ? spec.kpis : spec.cards;
+  const list = spec.cards;
   if (!Array.isArray(list) || index >= list.length || index < 0) {
-    throw badRequest(`${kind === 'kpi' ? 'kpi' : 'card'} index out of bounds`);
+    throw badRequest('card index out of bounds');
   }
-  list[index] = card;
+  list[index] = flattenCard(card);
   return spec;
 }
 

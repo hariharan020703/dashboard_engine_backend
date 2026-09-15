@@ -61,31 +61,27 @@
       "showCount": true
     }
   ],
-  "kpis": [
+  "cards": [
     {
       "id": "totalRevenue",
       "chartType": "badge_multi_value",
       "title": "Total Revenue USD",
-      "series": {
-        "main": {
-          "columns": [
-            {
-              "column": "Revenue",
-              "mapping": "VALUE",
-              "aggregation": "SUM",
-              "format": {
-                "type": "abbreviated",
-                "format": "#A",
-                "prefix": "$",
-                "suffix": " USD"
-              }
-            }
-          ],
-          "dateGrain": {
-            "column": "Booking Date",
-            "dateTimeElement": "MONTH"
+      "columns": [
+        {
+          "column": "Revenue",
+          "mapping": "VALUE",
+          "aggregation": "SUM",
+          "format": {
+            "type": "abbreviated",
+            "format": "#A",
+            "prefix": "$",
+            "suffix": " USD"
           }
         }
+      ],
+      "dateGrain": {
+        "column": "Booking Date",
+        "dateTimeElement": "MONTH"
       },
       "comparison": {
         "label": "vs last month",
@@ -103,20 +99,16 @@
       "id": "totalBookings",
       "chartType": "badge_multi_value",
       "title": "Total Bookings",
-      "series": {
-        "main": {
-          "columns": [
-            {
-              "column": "Booking Id",
-              "mapping": "VALUE",
-              "aggregation": "COUNTDISTINCT"
-            }
-          ],
-          "dateGrain": {
-            "column": "Booking Date",
-            "dateTimeElement": "MONTH"
-          }
+      "columns": [
+        {
+          "column": "Booking Id",
+          "mapping": "VALUE",
+          "aggregation": "COUNTDISTINCT"
         }
+      ],
+      "dateGrain": {
+        "column": "Booking Date",
+        "dateTimeElement": "MONTH"
       },
       "comparison": {
         "label": "vs last month",
@@ -134,25 +126,21 @@
       "id": "avgRating",
       "chartType": "badge_multi_value",
       "title": "Avg Movie Rating",
-      "series": {
-        "main": {
-          "columns": [
-            {
-              "column": "AVG RATING",
-              "mapping": "VALUE",
-              "aggregation": "AVERAGE",
-              "format": {
-                "type": "number",
-                "digits": 1,
-                "suffix": " / 10"
-              }
-            }
-          ],
-          "dateGrain": {
-            "column": "Booking Date",
-            "dateTimeElement": "MONTH"
+      "columns": [
+        {
+          "column": "AVG RATING",
+          "mapping": "VALUE",
+          "aggregation": "AVERAGE",
+          "format": {
+            "type": "number",
+            "digits": 1,
+            "suffix": " / 10"
           }
         }
+      ],
+      "dateGrain": {
+        "column": "Booking Date",
+        "dateTimeElement": "MONTH"
       },
       "comparison": {
         "label": "vs last month",
@@ -170,25 +158,21 @@
       "id": "avgOccupancy",
       "chartType": "badge_multi_value",
       "title": "Avg Occupancy Rate",
-      "series": {
-        "main": {
-          "columns": [
-            {
-              "column": "OCCUPANCY RATE",
-              "mapping": "VALUE",
-              "aggregation": "AVERAGE",
-              "format": {
-                "type": "percent",
-                "suffix": "%",
-                "digits": 1
-              }
-            }
-          ],
-          "dateGrain": {
-            "column": "Booking Date",
-            "dateTimeElement": "MONTH"
+      "columns": [
+        {
+          "column": "OCCUPANCY RATE",
+          "mapping": "VALUE",
+          "aggregation": "AVERAGE",
+          "format": {
+            "type": "percent",
+            "suffix": "%",
+            "digits": 1
           }
         }
+      ],
+      "dateGrain": {
+        "column": "Booking Date",
+        "dateTimeElement": "MONTH"
       },
       "comparison": {
         "label": "vs last month",
@@ -201,9 +185,7 @@
       "layout": {
         "span": 3
       }
-    }
-  ],
-  "cards": [
+    },
     {
       "id": "revenueByMovie",
       "chartType": "line_bar_combo",
@@ -215,17 +197,7 @@
           "mapping": "XTIME"
         },
         {
-          "column": "Revenue",
-          "aggregation": "SUM",
-          "mapping": "VALUE"
-        },
-        {
-          "column": "Profit",
-          "aggregation": "SUM",
-          "mapping": "VALUE"
-        },
-        {
-          "column": "TOTAL BOOKED",
+          "column": "Budget",
           "mapping": "VALUE",
           "aggregation": "SUM"
         }

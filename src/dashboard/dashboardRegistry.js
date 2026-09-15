@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { DASHBOARD_CONFIG_DIR } = require('../config/env');
+const { normalizeSpec } = require('./cardModel');
 
 /**
  * Resolves a dashboardId to its dashboard JSON.
@@ -57,7 +58,8 @@ function readSpecFile(filePath) {
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     throw new Error(`Dashboard file ${path.basename(filePath)} does not contain a dashboard object`);
   }
-  return spec;
+  // Every consumer sees one ordered `cards` list, whatever shape the file uses.
+  return normalizeSpec(spec);
 }
 
 function defaultSpecId() {

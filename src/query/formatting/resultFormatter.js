@@ -1,4 +1,5 @@
 const { formatPeriodDisplay, parsePeriodKey } = require('../semantic/semanticLayer');
+const { kpiValueColumn, readKpiPeriod } = require('../planning/queryPlanner');
 
 const PALETTE = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
 
@@ -105,45 +106,45 @@ function computeComparisonResult(rows, valueDisplay, grain) {
 
 function formatKpi(kpiSpec, rows) {
   if (!rows) return null;
-  const columns = kpiSpec.series?.main?.columns || kpiSpec.columns || [];
-  const vCol = columns.find((c) => c.mapping === 'VALUE') || columns[0];
+  const vCol = kpiValueColumn(kpiSpec);
   if (!vCol) return null;
 
-  const itemCol = kpiSpec.series?.main?.dateGrain?.column
-    || kpiSpec.series?.main?.groupBy?.[0]?.column
-    || kpiSpec.groupBy?.[0]?.column
-    || '';
-  const grain = kpiSpec.series?.main?.dateGrain?.dateTimeElement || '';
-
-  const hasComparison = kpiSpec.comparison && itemCol && grain;
+  const period = readKpiPeriod(kpiSpec);
 
   let comparisonResult;
   let value;
 
-  if (hasComparison) {
+  if (period) {
     comparisonResult = computeComparisonResult(
       rows,
       String(kpiSpec.comparison?.comp_val_displayed || '').toLowerCase().includes('absolute')
         ? 'absolute'
         : 'percent',
-      grain
+      period.grain
     );
     value = comparisonResult.current;
   } else {
     value = rows[0] && rows[0]._value != null ? Number(rows[0]._value) || 0 : 0;
   }
 
-  const text = formatValue(value, vCol.format || {});
+  // Field-level format wins, exactly as it does for a chart's value column.
+  const format = vCol.format || kpiSpec.format || {};
+  const text = formatValue(value, format);
   const previousText = comparisonResult?.prevBucket
-    ? formatValue(comparisonResult.previous ?? 0, vCol.format || {})
+    ? formatValue(comparisonResult.previous ?? 0, format)
     : '';
 
   return {
     id: kpiSpec.id,
+    chartType: kpiSpec.chartType,
     title: kpiSpec.title || kpiSpec.name,
+    description: kpiSpec.description,
     value,
     text,
-    format: vCol.format || {},
+    format,
+    // Only an explicit choice; no palette fallback, so the badge keeps its
+    // default accent until the Colours tab sets one.
+    color: kpiSpec.options?.colorMapping?.[vCol.column] || kpiSpec.options?.color || null,
     comparison: {
       label: kpiSpec.comparison?.label || '',
       delta: comparisonResult?.delta ?? 0,

@@ -3,6 +3,7 @@ const pool = require('../../config/database');
 const { getSpec } = require('../../dashboard/dashboardService');
 const { hydrateDashboard } = require('../../query/queryEngine');
 const { resolveSourceMetadata } = require('../../query/metadata/metadataResolver');
+const { cardKind, flattenCard } = require('../../dashboard/cardModel');
 const { sendError, badRequest } = require('../httpError');
 const { elapsed } = require('../middleware/requestTimer');
 
@@ -52,28 +53,26 @@ router.get('/dashboard/columns', async (req, res) => {
  * Runs one draft card through the full engine and returns the formatted result.
  * Nothing is persisted, and the same validation the dashboard uses applies — so
  * an invalid draft comes back as error metadata rather than a failed request.
+ *
+ * Whether the draft previews as a badge or a chart is decided the same way the
+ * dashboard decides it: by the card's chartType.
  */
 router.post('/dashboard/preview', async (req, res) => {
   try {
-    const { kind, card, filters } = req.body || {};
-    if (!card || typeof card !== 'object') throw badRequest('expected { kind, card }');
-    if (kind !== 'kpi' && kind !== 'chart') throw badRequest('kind must be "kpi" or "chart"');
+    const { card, filters } = req.body || {};
+    if (!card || typeof card !== 'object') throw badRequest('expected { card }');
 
+    const draft = flattenCard(card);
     const spec = getSpec();
     // Slicers stay in the spec so filter ids still resolve to columns; their
     // queries are already cached from the dashboard request.
-    const draftSpec = {
-      ...spec,
-      kpis: kind === 'kpi' ? [card] : [],
-      cards: kind === 'chart' ? [card] : [],
-    };
+    const draftSpec = { ...spec, cards: [draft] };
 
     const data = await hydrateDashboard(draftSpec, filters || {});
-    const visual = kind === 'kpi' ? data.kpis[0] : data.cards[0];
     console.log(`[API] POST /api/dashboard/preview ${elapsed(res)}ms`);
     res.json({
-      kind,
-      visual: visual || null,
+      kind: cardKind(draft),
+      visual: data.cards[0] || null,
       error: (data.errors || [])[0] || null,
     });
   } catch (err) {

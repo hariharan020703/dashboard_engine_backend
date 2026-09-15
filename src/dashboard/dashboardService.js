@@ -25,7 +25,6 @@ async function hydrateView(filters, spec) {
       description: resolvedSpec.description,
     },
     layout: resolvedSpec.layout || {},
-    kpis: data.kpis,
     cards: data.cards,
     slicers: data.slicers,
     errors: data.errors || [],

@@ -100,16 +100,9 @@ function candidateColumns(spec) {
 
   for (const slicer of spec.slicers || []) add(slicer.column);
 
-  for (const kpi of spec.kpis || []) {
-    addDateGrain(kpi);
-    addDateGrain(kpi.series && kpi.series.main);
-    addGroupBy(kpi.groupBy);
-    addGroupBy(kpi.series && kpi.series.main && kpi.series.main.groupBy);
-  }
-
+  // KPIs and charts are one list; the registry has already flattened both.
   for (const card of spec.cards || []) {
     addDateGrain(card);
-    addDateGrain(card.series && card.series.main);
     addGroupBy(card.groupBy);
     // A card with no explicit groupBy groups by its category column.
     if (!(card.groupBy && card.groupBy.length)) {

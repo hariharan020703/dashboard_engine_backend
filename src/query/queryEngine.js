@@ -7,6 +7,7 @@ const { optimizePlans } = require('./optimization/queryOptimizer');
 const { generateSql } = require('./sql/sqlGenerator');
 const { resolveSourceMetadata } = require('./metadata/metadataResolver');
 const { formatKpi, formatMergedKpi, formatCard, formatSlicer } = require('./formatting/resultFormatter');
+const { cardKind } = require('../dashboard/cardModel');
 
 const cache = new QueryCache(process.env.REDIS_URL, {
   ttl: parseInt(process.env.REDIS_TTL || '300', 10),
@@ -66,21 +67,24 @@ async function runWithConcurrency(tasks, limit) {
 }
 
 function kpiErrorPayload(entry) {
-  const kpi = entry.kpi || {};
+  const card = entry.card || {};
   return {
-    id: kpi.id,
-    title: kpi.title || kpi.name,
+    id: card.id,
+    chartType: card.chartType,
+    title: card.title || card.name,
+    description: card.description,
     value: 0,
     text: '',
     format: {},
+    color: null,
     // Kept as a full object so consumers can read comparison fields unconditionally.
     comparison: { label: '', delta: 0, deltaText: '', previousText: '', period: '', previousPeriod: '' },
     error: entry.error,
-    spec: kpi,
+    spec: card,
   };
 }
 
-function cardErrorPayload(entry, minHeight) {
+function chartErrorPayload(entry, minHeight) {
   const card = entry.card || {};
   return {
     id: card.id,
@@ -94,6 +98,11 @@ function cardErrorPayload(entry, minHeight) {
     error: entry.error,
     spec: card,
   };
+}
+
+/** The placeholder a card renders as when it could not be planned or executed. */
+function errorPayloadFor(entry, minHeight) {
+  return entry.kind === 'kpi' ? kpiErrorPayload(entry) : chartErrorPayload(entry, minHeight);
 }
 
 function slicerErrorPayload(entry) {
@@ -110,11 +119,30 @@ function slicerErrorPayload(entry) {
   };
 }
 
-function planEntries(items, planFn, key) {
-  return (items || []).map((item, specIndex) => {
-    const entry = { specIndex, [key]: item };
+/**
+ * Plans every card. A card's chartType picks its planner, and the resulting
+ * kind is kept on the entry so formatting and error payloads never re-derive it.
+ */
+function planCardEntries(cards, filtersList, meta) {
+  return (cards || []).map((card, specIndex) => {
+    const kind = cardKind(card);
+    const entry = { specIndex, card, kind };
     try {
-      entry.plan = planFn(item, specIndex);
+      entry.plan = kind === 'kpi'
+        ? planKpi(card, filtersList, meta, specIndex)
+        : planCard(card, filtersList, meta, specIndex);
+    } catch (err) {
+      entry.error = describeError(err, 'plan');
+    }
+    return entry;
+  });
+}
+
+function planSlicerEntries(slicers, meta) {
+  return (slicers || []).map((slicer, specIndex) => {
+    const entry = { specIndex, slicer };
+    try {
+      entry.plan = planSlicer(slicer, meta, specIndex);
     } catch (err) {
       entry.error = describeError(err, 'plan');
     }
@@ -125,10 +153,12 @@ function planEntries(items, planFn, key) {
 /**
  * Executes a dashboard spec.
  *
- * Each KPI, card and slicer is planned, executed and formatted in isolation: a
- * single invalid visual is reported as error metadata on that visual instead of
- * failing the whole dashboard. Filter resolution is the one request-level
- * failure, because an unapplied filter would silently misstate every visual.
+ * A dashboard is one ordered list of cards, and each card's chartType decides
+ * whether it is planned as a KPI badge or as a chart. Cards and slicers are
+ * planned, executed and formatted in isolation: a single invalid visual is
+ * reported as error metadata on that visual instead of failing the whole
+ * dashboard. Filter resolution is the one request-level failure, because an
+ * unapplied filter would silently misstate every visual.
  */
 async function hydrateDashboard(spec, filters) {
   const meta = await resolveSourceMetadata(spec);
@@ -140,16 +170,17 @@ async function hydrateDashboard(spec, filters) {
     throw new FilterResolutionError(err.message);
   }
 
-  const kpiEntries = planEntries(spec.kpis, (kpi, i) => planKpi(kpi, filtersList, meta, i), 'kpi');
-  const cardEntries = planEntries(spec.cards, (card, i) => planCard(card, filtersList, meta, i), 'card');
-  const slicerEntries = planEntries(spec.slicers, (slicer, i) => planSlicer(slicer, meta, i), 'slicer');
+  const cardEntries = planCardEntries(spec.cards, filtersList, meta);
+  const slicerEntries = planSlicerEntries(spec.slicers, meta);
 
-  const kpiByIndex = new Map(kpiEntries.map((e) => [e.specIndex, e]));
+  const cardByIndex = new Map(cardEntries.map((e) => [e.specIndex, e]));
 
+  // Only KPI plans are mergeable: several badges sharing a table, grain and
+  // filters collapse into one grouped query.
   const periodPlans = [];
   const simplePlans = [];
-  for (const entry of kpiEntries) {
-    if (!entry.plan) continue;
+  for (const entry of cardEntries) {
+    if (!entry.plan || entry.kind !== 'kpi') continue;
     if (entry.plan.kind === 'kpi-period') periodPlans.push(entry.plan);
     else simplePlans.push(entry.plan);
   }
@@ -157,13 +188,15 @@ async function hydrateDashboard(spec, filters) {
 
   const kpiEntriesForPlan = (plan) =>
     (plan.kind === 'kpi-period-merged'
-      ? plan.members.map((m) => kpiByIndex.get(m.specIndex))
-      : [kpiByIndex.get(plan.specIndex)]
+      ? plan.members.map((m) => cardByIndex.get(m.specIndex))
+      : [cardByIndex.get(plan.specIndex)]
     ).filter(Boolean);
 
   const jobs = [];
   for (const plan of optimizedKpiPlans) jobs.push({ type: 'kpi', plan });
-  for (const entry of cardEntries) if (entry.plan) jobs.push({ type: 'card', entry, plan: entry.plan });
+  for (const entry of cardEntries) {
+    if (entry.kind === 'chart' && entry.plan) jobs.push({ type: 'chart', entry, plan: entry.plan });
+  }
   for (const entry of slicerEntries) if (entry.plan) jobs.push({ type: 'slicer', entry, plan: entry.plan });
 
   const assignJobError = (job, error) => {
@@ -210,7 +243,7 @@ async function hydrateDashboard(spec, filters) {
     if (job.type === 'kpi') {
       if (job.plan.kind === 'kpi-period-merged') {
         for (const member of job.plan.members) {
-          const entry = kpiByIndex.get(member.specIndex);
+          const entry = cardByIndex.get(member.specIndex);
           if (!entry) continue;
           try {
             entry.formatted = formatMergedKpi(member, rows);
@@ -219,7 +252,7 @@ async function hydrateDashboard(spec, filters) {
           }
         }
       } else {
-        const entry = kpiByIndex.get(job.plan.specIndex);
+        const entry = cardByIndex.get(job.plan.specIndex);
         if (entry) {
           try {
             entry.formatted = formatKpi(job.plan.kpi, rows);
@@ -228,7 +261,7 @@ async function hydrateDashboard(spec, filters) {
           }
         }
       }
-    } else if (job.type === 'card') {
+    } else if (job.type === 'chart') {
       try {
         const formatted = formatCard(job.entry.card, rows, minHeight);
         job.entry.formatted = formatted ? { ...formatted, spec: job.entry.card } : null;
@@ -244,33 +277,31 @@ async function hydrateDashboard(spec, filters) {
     }
   }
 
-  // Declaration order from the dashboard JSON is authoritative for all three lists.
+  // Declaration order from the dashboard JSON is authoritative for both lists.
   const errors = [];
-  const collect = (entries, kind, errorPayload) =>
+  const collect = (entries, key, errorPayload) =>
     entries
       .map((entry) => {
         if (entry.error) {
-          errors.push({ kind, id: entry[kind]?.id, ...entry.error });
+          errors.push({ kind: entry.kind || key, id: entry[key]?.id, ...entry.error });
           return errorPayload(entry);
         }
         return entry.formatted || null;
       })
       .filter(Boolean);
 
-  const kpis = collect(kpiEntries, 'kpi', kpiErrorPayload);
-  const cards = collect(cardEntries, 'card', (e) => cardErrorPayload(e, minHeight));
+  const cards = collect(cardEntries, 'card', (e) => errorPayloadFor(e, minHeight));
   const slicers = collect(slicerEntries, 'slicer', slicerErrorPayload);
 
   const countJobs = (type) => runnable.filter((j) => j.type === type).length;
 
   return {
-    kpis,
     cards,
     slicers,
     errors,
     _stats: {
       kpiQueries: countJobs('kpi'),
-      cardQueries: countJobs('card'),
+      cardQueries: countJobs('chart'),
       slicerQueries: countJobs('slicer'),
       totalQueries: runnable.length,
       cacheHits: results.filter((r) => r && r.cached).length,

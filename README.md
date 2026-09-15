@@ -24,6 +24,7 @@ backend/
 │   │   └── database.js              MySQL connection pool
 │   │
 │   ├── dashboard/
+│   │   ├── cardModel.js             card shape: chartType -> kpi|chart, spec migration
 │   │   ├── dashboardRegistry.js     dashboardId -> dashboard JSON (file-backed)
 │   │   └── dashboardService.js      hydrates a spec into the API response shape
 │   │
@@ -56,19 +57,31 @@ GET /api/dashboard/view
   dashboard/dashboardService.js        hydrateView
   query/queryEngine.js                 hydrateDashboard
     query/metadata/metadataResolver    resolve + validate table and columns
-    query/planning/queryPlanner        one isolated plan per KPI / card / slicer
+    query/planning/queryPlanner        one isolated plan per card / slicer
     query/optimization/queryOptimizer  merge compatible KPI queries
     query/sql/sqlGenerator             parameterised SQL
     cache/queryCache                   keyed on SQL + bound params
     query/execution/queryExecutor      MySQL, bounded concurrency
-    query/formatting/resultFormatter   rows -> KPIs / cards / slicers
+    query/formatting/resultFormatter   rows -> cards / slicers
   JSON response
 ```
 
-Each KPI, card and slicer is planned, executed and formatted independently: one invalid
+Each card and slicer is planned, executed and formatted independently: one invalid
 visual returns `error` metadata for itself while the rest of the dashboard still renders.
 Filter resolution is the one request-level failure, because a silently unapplied filter
 would misstate every visual.
+
+## Cards
+
+A dashboard declares one ordered `cards` list. `dashboard/cardModel.js` reads each card's
+`chartType` to decide whether it is planned as a KPI badge (`planKpi` — one aggregated
+value, optionally compared across a date grain) or as a chart (`planCard`). Nothing else
+distinguishes them, so the same JSON keys mean the same thing on every card and the
+editor offers every option for every card.
+
+Older dashboard files that declare a separate `kpis` array, or nest a card's fields under
+`series.main`, are normalised into this shape when the registry reads them — so they keep
+working, and are rewritten flat the first time a card is saved.
 
 ## Adding a dashboard
 

@@ -28,8 +28,8 @@ function buildDateGroup(meta, column, grain) {
 }
 
 /**
- * Reads a date-grain declaration from any spec node that can carry one
- * (a card, or a KPI's series.main). Shape: { column, dateTimeElement|grain }.
+ * Reads a date-grain declaration from any spec node that can carry one.
+ * Shape: { column, dateTimeElement|grain }.
  */
 function readDateGrainSpec(node) {
   const dg = node && node.dateGrain;
@@ -127,42 +127,48 @@ function buildOrderBy(card, meta, measures, dimensions, dateGroup) {
   });
 }
 
+/** A card's fields, tolerating a legacy series.main body. */
+function cardColumns(card) {
+  return (card && (card.columns || card.series?.main?.columns)) || [];
+}
+
+/** The field a KPI reduces to a single number. */
+function kpiValueColumn(kpi) {
+  const columns = cardColumns(kpi);
+  return columns.find((c) => c.mapping === 'VALUE') || columns[0] || null;
+}
+
+/**
+ * The bucket a KPI compares across, or null when it has none — a KPI needs
+ * both a comparison block and a date grain before it can show a delta.
+ */
+function readKpiPeriod(kpi) {
+  if (!kpi || !kpi.comparison) return null;
+  return readDateGrainSpec(kpi) || readDateGrainSpec(kpi.series?.main);
+}
+
+/**
+ * A KPI renders a single aggregated value, so only its value column and its
+ * comparison bucket reach the query. Sort, limit and the remaining field roles
+ * are part of every card's spec but have no effect on a badge.
+ */
 function planKpi(kpi, filtersList, meta, specIndex) {
-  const columns = kpi.series?.main?.columns || kpi.columns || [];
-  const vCol = columns.find((c) => c.mapping === 'VALUE') || columns[0];
-  if (!vCol) return null;
-
-  const measure = buildMeasure(meta, vCol.column, vCol.aggregation, '_value');
-
-  const itemColRaw = kpi.series?.main?.dateGrain?.column
-    || kpi.series?.main?.groupBy?.[0]?.column
-    || kpi.groupBy?.[0]?.column
-    || '';
-  const grain = kpi.series?.main?.dateGrain?.dateTimeElement || '';
-
-  if (kpi.comparison && itemColRaw && grain) {
-    return {
-      kind: 'kpi-period',
-      id: kpi.id,
-      specIndex,
-      kpi,
-      source: meta.source,
-      measures: [measure],
-      dateGroup: buildDateGroup(meta, itemColRaw, grain),
-      orderBy: [],
-      filters: filtersList,
-      limit: null,
-    };
+  const vCol = kpiValueColumn(kpi);
+  if (!vCol) {
+    throw new Error('KPI card has no value column: add a field with the "Value" role.');
   }
 
+  const measure = buildMeasure(meta, vCol.column, vCol.aggregation, '_value');
+  const period = readKpiPeriod(kpi);
+
   return {
-    kind: 'kpi-simple',
+    kind: period ? 'kpi-period' : 'kpi-simple',
     id: kpi.id,
     specIndex,
     kpi,
     source: meta.source,
     measures: [measure],
-    dateGroup: null,
+    dateGroup: period ? buildDateGroup(meta, period.column, period.grain) : null,
     orderBy: [],
     filters: filtersList,
     limit: null,
@@ -170,7 +176,7 @@ function planKpi(kpi, filtersList, meta, specIndex) {
 }
 
 function planCard(card, filtersList, meta, specIndex) {
-  const columns = card.columns || [];
+  const columns = cardColumns(card);
   const valueCols = columns.filter((c) => c.mapping === 'VALUE');
   const xCol = columns.find((c) => ['XTIME', 'SERIES', 'ITEM'].includes(c.mapping));
 
@@ -226,6 +232,9 @@ function planSlicer(slicer, meta, specIndex) {
 
 module.exports = {
   buildFilters,
+  cardColumns,
+  kpiValueColumn,
+  readKpiPeriod,
   planKpi,
   planCard,
   planSlicer,
