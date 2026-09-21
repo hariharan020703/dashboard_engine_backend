@@ -66,6 +66,9 @@ const ALL_PERMISSIONS = [
 
   { id: 'data.read', label: 'Read Data', description: 'Read the source tables behind a granted dashboard.' },
 
+  { id: 'context.read', label: 'View Connections', description: 'See the warehouse connectors and the connections your company has configured.' },
+  { id: 'context.manage', label: 'Manage Connections', description: 'Connect a data warehouse, choose its datasets, and remove a connection.' },
+
   { id: 'scope.read', label: 'View Data Scopes', description: 'See the row-level scopes assigned to a user.' },
   { id: 'scope.update', label: 'Update Data Scopes', description: 'Assign row-level data scopes to a user.' },
 ];
@@ -122,6 +125,7 @@ const DEFAULT_ROLE_PERMISSIONS = {
     'group.read', 'group.create', 'group.update', 'group.delete',
     'access.read', 'access.grant', 'access.revoke',
     'dashboard.read', 'data.read',
+    'context.read', 'context.manage',
     'scope.read', 'scope.update',
   ],
   [USER]: ['dashboard.read', 'data.read'],

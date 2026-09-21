@@ -9,6 +9,7 @@ const {
   SUPER_ADMIN,
 } = require('./permissionCatalogue');
 const { BCRYPT_ROUNDS, bootstrapSuperAdmin } = require('../config/auth');
+const { bootstrapContextLayer } = require('../modules/context-layer/schema');
 
 /**
  * Idempotent bootstrap of the RBAC metadata database.
@@ -220,6 +221,20 @@ const TABLES = [
    )`,
 
   /*
+   * Which permission ids this installation has already seen.
+   *
+   * Not authorization data - a record of what the catalogue contained at
+   * previous starts, so "a capability that did not exist yet" can be told
+   * apart from "a capability an administrator revoked". Without it, revoking
+   * the last grant of a permission makes it look new again and it returns at
+   * the next restart.
+   */
+  `CREATE TABLE IF NOT EXISTS ${T.permissionSeedLog} (
+     permission_id VARCHAR(64)  PRIMARY KEY,
+     seeded_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+   )`,
+
+  /*
    * Login throttling state, keyed by the identifier that was typed rather than
    * by IP: the thing being protected is one account's password, and an IP is
    * cheap to change. Rows for identifiers that name no account are kept too, so
@@ -265,10 +280,35 @@ function rbacError() {
   return readyError;
 }
 
+/**
+ * Permission ids this installation has seen before.
+ *
+ * Read from `permission_seed_log`, except on the first start after the log was
+ * introduced: an installation that predates it has an empty log and a fully
+ * populated role_permissions table, so the log is backfilled from what the
+ * roles actually hold. That one time, a permission somebody had deliberately
+ * revoked looks new and comes back - unavoidable, because nothing recorded the
+ * difference before the log existed. Every start after it is exact.
+ */
+async function knownPermissions() {
+  const { rows: logged } = await db.query(`SELECT permission_id FROM ${T.permissionSeedLog}`);
+  if (logged.length) return new Set(logged.map((r) => r.permission_id));
+
+  const { rows: held } = await db.query(
+    `SELECT DISTINCT permission_id FROM ${T.rolePermissions}`
+  );
+  if (held.length) {
+    console.log(`[rbac] recording ${held.length} permission(s) this installation already had`);
+  }
+  return new Set(held.map((r) => r.permission_id));
+}
+
 async function seedRoles() {
   // Tracks which roles this start created, so defaults are seeded exactly once
   // in the role's lifetime rather than whenever the role happens to be empty.
   const created = new Set();
+
+  const alreadyKnown = await knownPermissions();
 
   for (const role of SYSTEM_ROLES) {
     const { rows } = await db.query(
@@ -300,6 +340,46 @@ async function seedRoles() {
       );
     }
     console.log(`[rbac] seeded ${permissions.length} default permissions for ${roleName}`);
+  }
+
+  /*
+   * Permissions the catalogue has gained since this installation last started.
+   *
+   * The rule above - defaults only for a role created just now - protects an
+   * administrator's deliberate edits, but on its own it also means a
+   * capability added in a later release never reaches the roles of an existing
+   * installation. The first company administrator to go looking for the new
+   * screen finds it missing, with nothing to indicate why.
+   *
+   * `permission_seed_log` is what separates the two cases. An id in the log
+   * existed at a previous start, so its absence from a role is a decision and
+   * is left alone. An id not in the log is genuinely new here, and the
+   * catalogue default applies.
+   */
+  for (const [roleName, permissions] of Object.entries(DEFAULT_ROLE_PERMISSIONS)) {
+    if (created.has(roleName)) continue; // just seeded in full, above
+    const added = permissions.filter((id) => !alreadyKnown.has(id));
+    if (!added.length) continue;
+
+    for (const permissionId of added) {
+      await db.query(
+        `INSERT INTO ${T.rolePermissions} (role_name, permission_id) VALUES (?, ?)
+         ON CONFLICT DO NOTHING`,
+        [roleName, permissionId]
+      );
+    }
+    console.log(
+      `[rbac] granted ${roleName} ${added.length} newly added permission(s): ${added.join(', ')}`
+    );
+  }
+
+  // Recorded whether or not anything was granted: what the log means is "the
+  // catalogue contained this", not "somebody holds it".
+  for (const permissionId of PERMISSION_IDS) {
+    await db.query(
+      `INSERT INTO ${T.permissionSeedLog} (permission_id) VALUES (?) ON CONFLICT DO NOTHING`,
+      [permissionId]
+    );
   }
 
   // A permission retired from the catalogue would still be handed to `can`,
@@ -369,6 +449,10 @@ async function bootstrapAppMeta() {
 
     await seedRoles();
     await seedSuperAdmin();
+
+    // Feature modules own their own tables. Created after the RBAC ones,
+    // because they reference companies and users.
+    await bootstrapContextLayer();
 
     ready = true;
     readyError = null;

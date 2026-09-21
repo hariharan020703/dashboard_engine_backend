@@ -61,6 +61,10 @@ const EVENTS = {
   ACCESS_GRANTED: 'access_granted',
   ACCESS_REVOKED: 'access_revoked',
   ACCESS_DENIED: 'access_denied',
+
+  CONTEXT_CONNECTION_CREATED: 'context_connection_created',
+  CONTEXT_CONNECTION_DELETED: 'context_connection_deleted',
+  CONTEXT_DATASETS_SELECTED: 'context_datasets_selected',
 };
 
 const KNOWN_EVENTS = new Set(Object.values(EVENTS));

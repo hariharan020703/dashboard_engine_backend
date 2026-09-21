@@ -49,6 +49,12 @@ const ERROR_STATUS = {
   // The dashboard exists but the table its spec names cannot be read.
   DASHBOARD_SOURCE_UNAVAILABLE: 503,
 
+  // Warehouse connectors (src/modules/context-layer)
+  // A credential the third party refused: the person must replace it.
+  CONNECTOR_AUTH_FAILED: 400,
+  // The third party could not be reached, or answered something unusable.
+  CONNECTOR_UNREACHABLE: 502,
+
   // Infrastructure
   EMAIL_DELIVERY_FAILED: 502,
   SERVICE_UNAVAILABLE: 503,
@@ -72,6 +78,9 @@ const DISCLOSED_SERVER_ERRORS = new Set([
   'EMAIL_DELIVERY_FAILED',
   'SERVICE_UNAVAILABLE',
   'DASHBOARD_SOURCE_UNAVAILABLE',
+  // Names the host and what it answered. Replacing that with "something went
+  // wrong" leaves somebody guessing at a third party's configuration.
+  'CONNECTOR_UNREACHABLE',
 ]);
 
 const SAFE_TO_DISCLOSE = new Set([

@@ -51,6 +51,10 @@ backend/
 │   │   ├── templates.js             message content, independent of transport
 │   │   └── providers/smtpProvider.js
 │   │
+│   ├── modules/                     feature modules - one folder each, see their READMEs
+│   │   ├── context-layer/           warehouse connections and their datasets
+│   │   └── data-analyst-agent/      reserved; nothing implemented yet
+│   │
 │   ├── config/
 │   │   ├── env.js                   loads .env once, resolves directory roots
 │   │   ├── configError.js           required/optional readers that fail loudly
@@ -91,7 +95,8 @@ backend/
 │
 ├── tests/rbac.e2e.js                the RBAC / tenancy / token / onboarding suite
 ├── tests/smtpSink.js                an in-process SMTP relay the suite reads mail from
-└── tests/reportingFixture.js        a small source table so dashboard checks are real
+├── tests/reportingFixture.js        a small source table so dashboard checks are real
+└── tests/contextLayer.test.js       the context layer, against a stand-in Domo
 ```
 
 ## Request flow
@@ -378,6 +383,28 @@ for as long as it is valid. Missing or half-filled settings are a startup crash 
 variable, and `transporter.verify()` runs at startup so bad credentials surface then rather
 than as a failed onboarding hours later.
 
+### Feature modules
+
+`src/modules/<feature>` holds a feature whole: its router, its services, its
+tables, its provider code. The point is that adding or removing one touches a
+handful of lines outside the folder rather than threading through `src/routes`,
+`src/auth` and `src/config` — so two people building two features are not
+editing the same files.
+
+| | |
+|---|---|
+| `context-layer` | Warehouse connections. Domo is implemented; Snowflake, Databricks, BigQuery, Redshift and PostgreSQL are listed as `planned` and refused by the API. |
+| `data-analyst-agent` | Reserved. A placeholder page and a README, nothing else. |
+
+Each has its own README. The context layer's is worth reading before touching
+it: it stores a third-party credential **reversibly**, which is the one place
+in this application that is true, and it calls Domo endpoints that are not part
+of Domo's versioned public API.
+
+```bash
+DB_NAME=app_e2e npm run test:context   # 59 checks, against a stand-in Domo
+```
+
 ### Row-level data scopes
 
 `user_data_scope` records which slices of the data a user may see. It is **stored and
@@ -410,6 +437,27 @@ Configuration is read at require time and validated: a missing `DB_HOST`, `DB_NA
 crash naming the variable. There are no fallback secrets — a default one is
 indistinguishable at runtime from a correctly configured deployment, and forges every token
 in the system.
+
+#### New permissions on an existing installation
+
+Role defaults are seeded only for a role the current start actually created,
+so an administrator who deliberately narrows a role does not get the defaults
+restored under them at the next restart. On its own that also means a
+permission added in a later release never reaches the roles of an installation
+that already exists — the first company administrator to look for the new
+screen finds it missing, with nothing to say why.
+
+`permission_seed_log` separates the two cases. It records which permission ids
+the catalogue has contained at a previous start, whether or not anybody was
+granted them. At each start:
+
+- an id **in** the log that no role holds was revoked on purpose, and is left alone;
+- an id **not in** the log is new here, and the catalogue default is applied.
+
+The first start after the log was introduced backfills it from what the roles
+currently hold, so that one time a previously revoked permission is treated as
+new and comes back. Nothing recorded the difference before the log existed;
+every start after it is exact.
 
 ### What is configured where
 
@@ -444,6 +492,7 @@ npm start                 # serve the API and the built frontend
 npm run setup:indexes     # create indexes from dashboard metadata (--dry-run supported)
 npm run reset:access      # email an account a new activation link, without a token
 npm run test:e2e          # the RBAC/tenancy/token suite (see tests/rbac.e2e.js)
+npm run test:context      # the context layer (see tests/contextLayer.test.js)
 ```
 
 The suite brings its own SMTP relay and its own reporting table, so it needs a throwaway

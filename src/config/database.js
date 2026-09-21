@@ -58,6 +58,7 @@ const T = {
   refreshTokens: q('refresh_tokens'),
   userTokens: q('user_tokens'),
   loginAttempts: q('login_attempts'),
+  permissionSeedLog: q('permission_seed_log'),
 };
 
 /** Runs `work` inside a transaction on a dedicated connection. */

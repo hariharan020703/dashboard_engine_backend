@@ -12,6 +12,7 @@ const accessRoutes = require('./accessRoutes');
 const dashboardRoutes = require('./dashboardRoutes');
 const metadataRoutes = require('./metadataRoutes');
 const auditRoutes = require('./auditRoutes');
+const contextLayerRoutes = require('../modules/context-layer/routes');
 
 /** Everything under /api. Mounted by the server as a single unit. */
 const router = express.Router();
@@ -45,6 +46,10 @@ router.use('/roles', roleRoutes);
 router.use('/groups', groupRoutes);
 router.use('/access', accessRoutes);
 router.use('/audit', auditRoutes);
+
+// Feature modules live under src/modules and are mounted as whole units, so
+// adding or removing one touches this line and nothing else.
+router.use('/context', contextLayerRoutes);
 
 /*
  * Both dashboard routers mount UNDER /dashboard rather than at the root.
