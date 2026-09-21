@@ -11,6 +11,7 @@ const groupRoutes = require('./groupRoutes');
 const accessRoutes = require('./accessRoutes');
 const dashboardRoutes = require('./dashboardRoutes');
 const metadataRoutes = require('./metadataRoutes');
+const auditRoutes = require('./auditRoutes');
 
 /** Everything under /api. Mounted by the server as a single unit. */
 const router = express.Router();
@@ -43,6 +44,7 @@ router.use('/users', userRoutes);
 router.use('/roles', roleRoutes);
 router.use('/groups', groupRoutes);
 router.use('/access', accessRoutes);
+router.use('/audit', auditRoutes);
 
 /*
  * Both dashboard routers mount UNDER /dashboard rather than at the root.
