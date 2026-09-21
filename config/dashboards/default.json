@@ -4,11 +4,11 @@
   "title": "Cinema Analytics Dashboard",
   "description": "Booking & Revenue Insights",
   "dataSource": {
-    "type": "mysql",
-    "database": "sales_analysis",
-    "table": "dashboard",
+    "type": "postgres",
+    "schema": "public",
+    "table": "cinema_analysis",
     "dateParse": {
-      "Booking Date": "%b %d, %Y"
+      "Booking Date": "DD-Mon-YY"
     }
   },
   "layout": {

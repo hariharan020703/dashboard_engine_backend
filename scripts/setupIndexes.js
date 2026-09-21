@@ -1,85 +1,87 @@
 require('../src/config/env');
-const pool = require('../src/config/database');
+const { db } = require('../src/config/database');
 const registry = require('../src/dashboard/dashboardRegistry');
-const { resolveSourceMetadata } = require('../src/query/metadata/metadataResolver');
+const { resolveSourceMetadata } = require('../src/query/metadataResolver');
+const { quoteIdentifier, quoteQualified } = require('../src/query/semanticLayer');
 
 /**
  * Creates indexes for the columns a dashboard actually filters and groups on.
  *
  * Nothing about any particular dashboard is hardcoded: candidate columns come
  * from the dashboard JSON (slicers, groupBy, date grains) and their types come
- * from INFORMATION_SCHEMA. Measures are deliberately excluded — they are
- * aggregated, not filtered, so an index on them would not be used.
+ * from the catalogue. Measures are deliberately excluded - they are aggregated,
+ * not filtered, so an index on them would not be used.
  *
  * Usage:
- *   npm run setup:indexes                                  # every registered dashboard
+ *   npm run setup:indexes                            # every registered dashboard
  *   node scripts/setupIndexes.js <dashboardId> ...   # named dashboards only
  *   node scripts/setupIndexes.js --dry-run           # print the DDL, change nothing
- *   node scripts/setupIndexes.js --prefix=80         # prefix for long text columns
  */
 
-// MySQL cannot index these without a prefix length.
-const PREFIX_REQUIRED_TYPES = new Set([
-  'tinytext', 'text', 'mediumtext', 'longtext',
-  'tinyblob', 'blob', 'mediumblob', 'longblob',
-]);
-// Types that cannot be indexed directly at all.
-const UNINDEXABLE_TYPES = new Set(['json', 'geometry']);
-const DEFAULT_TEXT_PREFIX = 64;
-// Longest varchar/char indexed without a prefix (keeps us well inside InnoDB limits).
-const MAX_INLINE_STRING_LENGTH = 191;
+/*
+ * Types PostgreSQL's default btree cannot index directly.
+ *
+ * Short, because there is no prefix-length requirement for long text: btree
+ * indexes `text` and `varchar` identically and without a declared length, and
+ * an oversized value is rejected at insert time rather than needing a prefix
+ * declared up front.
+ */
+const UNINDEXABLE_TYPES = new Set(['json', 'xml', 'point', 'polygon', 'line', 'lseg', 'path', 'box', 'circle']);
+
+// PostgreSQL truncates identifiers at 63 bytes; a truncated index name would
+// silently collide with another.
+const MAX_IDENTIFIER_LENGTH = 63;
 
 function parseArgs(argv) {
   const ids = [];
   let dryRun = false;
-  let prefix = DEFAULT_TEXT_PREFIX;
 
   for (const arg of argv) {
     if (arg === '--dry-run' || arg === '-n') dryRun = true;
-    else if (arg.startsWith('--prefix=')) {
-      const n = parseInt(arg.slice('--prefix='.length), 10);
-      if (!Number.isInteger(n) || n < 1 || n > 255) {
-        throw new Error(`Invalid --prefix value: ${arg}. Expected an integer 1-255.`);
-      }
-      prefix = n;
-    } else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
+    else if (arg.startsWith('-')) throw new Error(`Unknown option: ${arg}`);
     else ids.push(arg);
   }
-  return { ids, dryRun, prefix };
-}
-
-function quote(name) {
-  return '`' + String(name).replace(/`/g, '``') + '`';
+  return { ids, dryRun };
 }
 
 function slug(value) {
   return String(value).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
 }
 
-function indexName(table, column) {
-  const base = `idx_${slug(table)}_${slug(column)}`;
-  return base.length <= 64 ? base : base.slice(0, 64).replace(/_+$/, '');
+function indexName(table, column, suffix = '') {
+  const base = `idx_${slug(table)}_${slug(column)}${suffix}`;
+  return base.length <= MAX_IDENTIFIER_LENGTH
+    ? base
+    : base.slice(0, MAX_IDENTIFIER_LENGTH).replace(/_+$/, '');
 }
 
-function declaredStringLength(columnType) {
-  const match = /^(?:var)?char\s*\(\s*(\d+)\s*\)/i.exec(String(columnType || ''));
-  return match ? parseInt(match[1], 10) : null;
-}
-
-/** How this column can be indexed, based purely on its database type. */
-function indexTarget(colMeta, textPrefix) {
+/**
+ * The index expressions worth creating for one column.
+ *
+ * Two of them, for a non-text column. Slicer values arrive from a URL as
+ * strings, so the engine compares `column::text = $1` (see
+ * semanticLayer.buildWhereSql), and a plain index on an integer column cannot
+ * serve that - PostgreSQL only uses an index whose expression matches. So an
+ * expression index on the cast is created alongside the ordinary one, which
+ * still serves GROUP BY and ORDER BY.
+ */
+function indexTargets(colMeta) {
   const type = String(colMeta.type || '').toLowerCase();
   if (UNINDEXABLE_TYPES.has(type)) {
-    return { skip: `type ${type} cannot be indexed directly` };
+    return { skip: `type ${type} cannot be indexed with a default btree` };
   }
-  if (PREFIX_REQUIRED_TYPES.has(type)) {
-    return { expr: `${quote(colMeta.name)}(${textPrefix})`, note: `${type}, prefix ${textPrefix}` };
+
+  const col = quoteIdentifier(colMeta.name);
+  const targets = [{ expr: col, suffix: '', note: type }];
+
+  if (!colMeta.isString) {
+    targets.push({
+      expr: `((${col})::text)`,
+      suffix: '_text',
+      note: `${type} cast to text, for slicer filters`,
+    });
   }
-  const length = declaredStringLength(colMeta.columnType);
-  if (length && length > MAX_INLINE_STRING_LENGTH) {
-    return { expr: `${quote(colMeta.name)}(${textPrefix})`, note: `${colMeta.columnType}, prefix ${textPrefix}` };
-  }
-  return { expr: quote(colMeta.name), note: type };
+  return { targets };
 }
 
 /**
@@ -119,30 +121,51 @@ function candidateColumns(spec) {
   return [...columns];
 }
 
-async function leadingIndexedColumns(table) {
-  const [rows] = await pool.query(`SHOW INDEX FROM ${quote(table)}`);
+/**
+ * What is already indexed on a table: the index names, and the first column of
+ * each so an existing composite index counts as covering its leading column.
+ */
+async function existingIndexes(schema, table) {
+  const { rows } = await db.query(
+    `SELECT i.relname AS index_name,
+            a.attname AS column_name,
+            k.ordinality AS position
+       FROM pg_class      t
+       JOIN pg_namespace  n  ON n.oid = t.relnamespace
+       JOIN pg_index      ix ON ix.indrelid = t.oid
+       JOIN pg_class      i  ON i.oid = ix.indexrelid
+       CROSS JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ordinality)
+       LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+      WHERE n.nspname = ? AND t.relname = ?`,
+    [schema, table]
+  );
+
   const leading = new Set();
   const names = new Set();
   for (const row of rows) {
-    names.add(row.Key_name);
-    if (Number(row.Seq_in_index) === 1) leading.add(String(row.Column_name).toLowerCase());
+    names.add(row.index_name);
+    // attnum 0 marks an expression rather than a plain column; those have no
+    // attname and are matched by index name instead.
+    if (Number(row.position) === 1 && row.column_name) {
+      leading.add(String(row.column_name).toLowerCase());
+    }
   }
   return { leading, names };
 }
 
 (async () => {
-  const { ids, dryRun, prefix } = parseArgs(process.argv.slice(2));
+  const { ids, dryRun } = parseArgs(process.argv.slice(2));
 
   const dashboards = ids.length ? ids : registry.listDashboards().map((d) => d.id);
   if (!dashboards.length) {
     console.log('No dashboards found. Nothing to index.');
-    await pool.end();
+    await db.end();
     return;
   }
 
   console.log(`Dashboards: ${dashboards.join(', ')}${dryRun ? '  (dry run)' : ''}`);
 
-  // table -> Map(lowercased column -> column metadata)
+  // "schema.table" -> { schema, table, columns: Map(lowercased name -> metadata) }
   const wanted = new Map();
 
   for (const id of dashboards) {
@@ -162,65 +185,71 @@ async function leadingIndexedColumns(table) {
       continue;
     }
 
-    const table = meta.table.table;
-    if (!wanted.has(table)) wanted.set(table, new Map());
-    const forTable = wanted.get(table);
+    const { schema, table } = meta.table;
+    const key = `${schema}.${table}`;
+    if (!wanted.has(key)) wanted.set(key, { schema, table, columns: new Map() });
+    const entry = wanted.get(key);
 
-    const columns = candidateColumns(spec);
     const resolved = [];
-    for (const name of columns) {
+    for (const name of candidateColumns(spec)) {
       const colMeta = meta.table.columnMap.get(name) || meta.table.byLower.get(name.toLowerCase());
       if (!colMeta) {
-        console.log(`! ${id}: column "${name}" is not in ${table}, skipping`);
+        console.log(`! ${id}: column "${name}" is not in ${key}, skipping`);
         continue;
       }
-      forTable.set(colMeta.name.toLowerCase(), colMeta);
+      entry.columns.set(colMeta.name.toLowerCase(), colMeta);
       resolved.push(colMeta.name);
     }
-    console.log(`  ${id} -> ${table}: ${resolved.length ? resolved.join(', ') : '(no filter/group columns)'}`);
+    console.log(`  ${id} -> ${key}: ${resolved.length ? resolved.join(', ') : '(no filter/group columns)'}`);
   }
 
   let created = 0;
   let skipped = 0;
 
-  for (const [table, columns] of wanted) {
+  for (const [key, { schema, table, columns }] of wanted) {
     if (!columns.size) continue;
-    console.log(`\n${table}`);
-    const { leading, names } = await leadingIndexedColumns(table);
+    console.log(`\n${key}`);
+    const { leading, names } = await existingIndexes(schema, table);
 
     for (const colMeta of columns.values()) {
-      const name = indexName(table, colMeta.name);
-      const target = indexTarget(colMeta, prefix);
-
-      if (target.skip) {
-        console.log(`  - ${colMeta.name}: ${target.skip}`);
-        skipped += 1;
-        continue;
-      }
-      if (leading.has(colMeta.name.toLowerCase())) {
-        console.log(`  ✓ ${colMeta.name}: already the leading column of an index`);
-        skipped += 1;
-        continue;
-      }
-      if (names.has(name)) {
-        console.log(`  ✓ ${name}: already exists`);
+      const { skip, targets } = indexTargets(colMeta);
+      if (skip) {
+        console.log(`  - ${colMeta.name}: ${skip}`);
         skipped += 1;
         continue;
       }
 
-      const sql = `CREATE INDEX ${quote(name)} ON ${quote(table)} (${target.expr})`;
-      if (dryRun) {
-        console.log(`  ~ ${sql}   -- ${target.note}`);
-      } else {
-        await pool.query(sql);
-        console.log(`  + ${name} on ${colMeta.name} (${target.note})`);
+      for (const target of targets) {
+        const name = indexName(table, colMeta.name, target.suffix);
+
+        // A plain index is covered by any index that already leads with the
+        // column; an expression index is matched by name only.
+        if (!target.suffix && leading.has(colMeta.name.toLowerCase())) {
+          console.log(`  = ${colMeta.name}: already the leading column of an index`);
+          skipped += 1;
+          continue;
+        }
+        if (names.has(name)) {
+          console.log(`  = ${name}: already exists`);
+          skipped += 1;
+          continue;
+        }
+
+        const sql =
+          `CREATE INDEX ${quoteIdentifier(name)} ON ${quoteQualified(schema, table)} (${target.expr})`;
+        if (dryRun) {
+          console.log(`  ~ ${sql}   -- ${target.note}`);
+        } else {
+          await db.query(sql);
+          console.log(`  + ${name} on ${colMeta.name} (${target.note})`);
+        }
+        created += 1;
       }
-      created += 1;
     }
   }
 
   console.log(`\n${dryRun ? 'Would create' : 'Created'}: ${created}, skipped: ${skipped}`);
-  await pool.end();
+  await db.end();
 })().catch((e) => {
   console.error('ERROR', e.message);
   process.exit(1);

@@ -1,21 +1,27 @@
 {
   "name": "backend",
   "version": "1.0.0",
-  "description": "Metadata-driven BI dashboard query engine (Express + MySQL + Redis)",
-  "main": "src/app/server.js",
+  "description": "Metadata-driven BI dashboard query engine (Express + PostgreSQL + Redis)",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node src/app/server.js",
-    "setup:indexes": "node scripts/setupIndexes.js"
+    "start": "node src/server.js",
+    "setup:indexes": "node scripts/setupIndexes.js",
+    "reset:access": "node scripts/resetAccess.js",
+    "test:e2e": "node tests/rbac.e2e.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "ioredis": "^5.11.1",
-    "mysql2": "^3.24.3"
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^10.0.10",
+    "pg": "^8.23.0"
   }
 }

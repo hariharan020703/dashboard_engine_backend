@@ -1,12 +1,12 @@
 require('../config/env');
-const pool = require('../config/database');
-const { executeQuery } = require('./execution/queryExecutor');
-const QueryCache = require('../cache/queryCache');
-const { buildFilters, planKpi, planCard, planSlicer } = require('./planning/queryPlanner');
-const { optimizePlans } = require('./optimization/queryOptimizer');
-const { generateSql } = require('./sql/sqlGenerator');
-const { resolveSourceMetadata } = require('./metadata/metadataResolver');
-const { formatKpi, formatMergedKpi, formatCard, formatSlicer } = require('./formatting/resultFormatter');
+const { db } = require('../config/database');
+const { executeQuery } = require('./queryExecutor');
+const QueryCache = require('./queryCache');
+const { buildFilters, planKpi, planCard, planSlicer } = require('./queryPlanner');
+const { optimizePlans } = require('./queryOptimizer');
+const { generateSql } = require('./sqlGenerator');
+const { resolveSourceMetadata } = require('./metadataResolver');
+const { formatKpi, formatMergedKpi, formatCard, formatSlicer } = require('./resultFormatter');
 const { cardKind } = require('../dashboard/cardModel');
 
 const cache = new QueryCache(process.env.REDIS_URL, {
@@ -14,7 +14,7 @@ const cache = new QueryCache(process.env.REDIS_URL, {
   prefix: process.env.CACHE_PREFIX || 'bi',
 });
 
-const MAX_CONCURRENT = parseInt(process.env.QUERY_CONCURRENCY || '6', 10);
+const { QUERY_CONCURRENCY: MAX_CONCURRENT } = require('../config/appConfig');
 
 class FilterResolutionError extends Error {
   constructor(message) {
@@ -45,7 +45,7 @@ async function runQueryWithCache(query, dashKey, ttl) {
   if (cached) {
     return { rows: cached, cached: true, elapsed: 0 };
   }
-  const { rows, elapsed } = await executeQuery(pool, query.sql, query.params);
+  const { rows, elapsed } = await executeQuery(db, query.sql, query.params);
   await cache.set(key, rows, ttl);
   return { rows, cached: false, elapsed };
 }

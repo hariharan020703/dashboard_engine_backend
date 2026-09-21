@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Copy this file to scope-dimensions.json to switch row-level scopes on.",
+    "Each entry names a column an admin may scope a user against; the selectable",
+    "values are read from that column with SELECT DISTINCT, so the admin UI can",
+    "only ever offer values that exist in the data. 'database' is optional and",
+    "defaults to the connection's own. See src/auth/scopeService.js — the scopes",
+    "are stored and configurable but not yet applied to queries."
+  ],
+  "dimensions": [
+    {
+      "dimension": "theater",
+      "label": "Theater",
+      "table": "cinema_analysis",
+      "column": "Theater Name"
+    },
+    {
+      "dimension": "genre",
+      "label": "Genre",
+      "table": "cinema_analysis",
+      "column": "Genre"
+    }
+  ]
+}
