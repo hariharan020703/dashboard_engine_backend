@@ -81,13 +81,42 @@ Two instance endpoints are used, both in `providers/domo.js`:
 | | |
 |---|---|
 | `GET /api/content/v2/users/me` | validates the token and reports whose it is |
-| `POST /api/data/ui/v3/datasources/search` | lists datasets, paged |
+| `GET /api/data/v3/datasources?limit=&offset=&sort=name` | lists datasets, paged |
 
 **These are not part of Domo's versioned public API.** They are the endpoints
 Domo's own web client uses, and Domo can change them without notice. They are
 kept together and named for that reason, and every failure reports the status
 and Domo's own message — so if a shape changes, the error says where, and the
 fix is this one file.
+
+The dataset list is a GET rather than the UI's `POST .../datasources/search`.
+The search endpoint takes a body whose shape is tied to Domo's own filter
+model, and a body that is subtly wrong comes back **200 with no rows** — which
+is indistinguishable from an account that genuinely has no datasets. A GET has
+no body to get wrong.
+
+### An unrecognised response is an error
+
+`extractRows` accepts a bare array, `{dataSources}`, `{datasources}`,
+`{searchObjects}`, `{results}`, `{items}` and `{searchResultsMap: {DATASET}}`.
+Anything else throws `CONNECTOR_UNREACHABLE` and logs the response.
+
+It deliberately does **not** fall back to an empty list. An earlier version
+did, with `|| []` at the end of the lookup, and the result was the worst kind
+of failure: a wrong endpoint produced a connection that said "connected" and
+showed zero datasets, with no error anywhere to explain it. "I do not
+understand this response" and "this account has no datasets" have to stay
+distinguishable.
+
+The log line carries the keys and a truncated sample, so a changed shape can
+be fixed in one pass:
+
+```
+[domo] unrecognised response from /api/data/v3/datasources - keys: totalResultCount, somethingElse
+[domo] sample: {"totalResultCount":42,"somethingElse":{}}
+```
+
+There is no credential in a dataset list, which is why it is safe to log.
 
 Validation happens **before** anything is written. A connection row whose token
 was never checked looks identical on screen to one that works, and the moment

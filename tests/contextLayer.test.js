@@ -22,7 +22,10 @@ process.env.CREDENTIAL_SECRET = process.env.CREDENTIAL_SECRET
   || 'test-only-credential-secret-at-least-32-chars';
 
 const { db } = require('../src/config/database');
-const { CT, bootstrapContextLayer } = require('../src/modules/context-layer/schema');
+const { CT } = require('../src/modules/context-layer/schema');
+// The whole schema, not just this module's two tables: they reference
+// `companies` and `users`, so the suite has to stand up on an empty database.
+const { bootstrapAppMeta } = require('../src/auth/appMetaSchema');
 const { seal, open, hint } = require('../src/modules/context-layer/secretBox');
 const domo = require('../src/modules/context-layer/providers/domo');
 const service = require('../src/modules/context-layer/connectionService');
@@ -65,6 +68,8 @@ const GOOD_HOST = 'acme.domo.com';
 let datasetCount = 3;
 /** Requests the stand-in saw, so paging and headers can be asserted. */
 let seenRequests = [];
+/** How the stand-in wraps its rows. Swapped per test. */
+let responseShape = (rows) => rows;
 
 function fakeDataset(i) {
   return {
@@ -88,7 +93,9 @@ function installFakeDomo() {
   global.fetch = async (url, init = {}) => {
     const target = new URL(url);
     const token = (init.headers || {})['X-DOMO-Developer-Token'];
-    seenRequests.push({ host: target.host, path: target.pathname, token, init });
+    seenRequests.push({
+      host: target.host, path: target.pathname, query: target.search.replace(/^\?/, ''), token, init,
+    });
 
     if (target.host === 'unreachable.domo.com') {
       throw Object.assign(new Error('getaddrinfo ENOTFOUND unreachable.domo.com'), {
@@ -103,13 +110,29 @@ function installFakeDomo() {
       return json({ id: 42, displayName: 'Ada Lovelace', emailAddress: 'ada@example.com' });
     }
 
-    if (target.pathname === '/api/data/ui/v3/datasources/search') {
-      const body = JSON.parse(init.body);
+    if (target.pathname === '/api/data/v3/datasources') {
+      const limit = Number(target.searchParams.get('limit'));
+      const offset = Number(target.searchParams.get('offset'));
+
+      /*
+       * The real instance enforces this, and answers 400 above it. The
+       * stand-in enforces it too, because a fake that accepts anything is how
+       * a page size of 100 passed every test here and then failed on the
+       * first real connection.
+       */
+      if (!(limit >= 0 && limit <= 50)) {
+        return json(
+          { status: 400, message: `'limit' param must be nonnegative and <= 50. actual=${limit}` },
+          400
+        );
+      }
+
       const page = [];
-      for (let i = body.offset; i < Math.min(body.offset + body.count, datasetCount); i++) {
+      for (let i = offset; i < Math.min(offset + limit, datasetCount); i++) {
         page.push(fakeDataset(i));
       }
-      return json({ dataSources: page, totalResultCount: datasetCount });
+      // `responseShape` lets a test make Domo answer in a different shape.
+      return json(responseShape(page, datasetCount));
     }
 
     return json({ message: 'no such endpoint' }, 404);
@@ -150,7 +173,7 @@ async function cleanup() {
 
 (async () => {
   installFakeDomo();
-  await bootstrapContextLayer();
+  await bootstrapAppMeta();
 
   const companyA = await makeCompany('Ctx Alpha');
   const companyB = await makeCompany('Ctx Beta');
@@ -260,19 +283,69 @@ async function cleanup() {
   check('row counts are numbers', listed.every((d) => typeof d.rowCount === 'number'));
   check('the owner is flattened to a name', listed[0].owner === 'Ada Lovelace', String(listed[0].owner));
 
-  // 250 across three pages of 100, 100, 50 - the page loop is the part most
-  // likely to either stop early or never stop at all.
-  datasetCount = 250;
+  // 260 across six pages of 50, the last one short - the page loop is the part
+  // most likely to either stop early or never stop at all.
+  datasetCount = 260;
   seenRequests = [];
   const paged = await service.fetchDatasets(adminA, connectionId);
-  check('paging reads every dataset', paged.length === 250, String(paged.length));
-  const searchCalls = seenRequests.filter((r) => r.path === '/api/data/ui/v3/datasources/search');
-  check('it took three pages', searchCalls.length === 3, String(searchCalls.length));
-  check('ids are unique across pages', new Set(paged.map((d) => d.id)).size === 250);
+  check('paging reads every dataset', paged.length === 260, String(paged.length));
+  const listCalls = seenRequests.filter((r) => r.path === '/api/data/v3/datasources');
+  check('it took six pages of 50', listCalls.length === 6, String(listCalls.length));
+  check('ids are unique across pages', new Set(paged.map((d) => d.id)).size === 260);
+
+  // The request Domo actually accepts, asserted field by field: every one of
+  // these was wrong or missing in the first version that reached a real
+  // instance.
+  const first = new URL('https://x' + listCalls[0].path + (listCalls[0].search || ''));
+  const params = new URLSearchParams(listCalls[0].query || '');
+  check('limit never exceeds the cap Domo enforces',
+    listCalls.every((c) => Number(new URLSearchParams(c.query).get('limit')) <= 50),
+    JSON.stringify(listCalls.map((c) => new URLSearchParams(c.query).get('limit'))));
+  check('offset steps by the page size',
+    listCalls.map((c) => new URLSearchParams(c.query).get('offset')).join() === '0,50,100,150,200,250',
+    listCalls.map((c) => new URLSearchParams(c.query).get('offset')).join());
+  check('row and column counts are requested',
+    (params.get('part') || '').includes('rowcolcount'), params.get('part'));
+  check('hidden datasets are included', params.get('includeHidden') === 'true');
+  check('the order is stable across pages', params.get('orderBy') === 'createdAt');
+  void first;
 
   datasetCount = 0;
   check('a token with no datasets is not an error', (await service.fetchDatasets(adminA, connectionId)).length === 0);
   datasetCount = 3;
+
+  /* ------------------------------------------------------------------ */
+  section('Whatever shape Domo answers in');
+
+  datasetCount = 3;
+  for (const [label, wrap] of [
+    ['a bare array', (rows) => rows],
+    ['{ dataSources }', (rows) => ({ dataSources: rows })],
+    ['{ searchObjects }', (rows) => ({ searchObjects: rows })],
+    ['{ results }', (rows) => ({ results: rows })],
+    ['{ searchResultsMap: { DATASET } }', (rows) => ({ searchResultsMap: { DATASET: rows } })],
+  ]) {
+    responseShape = wrap;
+    const got = await service.fetchDatasets(adminA, connectionId);
+    check(`${label} is read correctly`, got.length === 3, String(got.length));
+  }
+
+  /*
+   * The regression that started all this: an unrecognised response used to be
+   * read as an empty list, so a wrong endpoint looked exactly like a working
+   * connection to an account with no datasets - "connected", zero rows, no
+   * error anywhere.
+   */
+  responseShape = () => ({ totalResultCount: 42, somethingElse: {} });
+  const unknownShape = await codeOf(() => service.fetchDatasets(adminA, connectionId));
+  check('an unrecognised shape is an error, not an empty list',
+    unknownShape === 'CONNECTOR_UNREACHABLE', unknownShape);
+
+  responseShape = () => ({ dataSources: [] });
+  check('a genuinely empty list is still not an error',
+    (await service.fetchDatasets(adminA, connectionId)).length === 0);
+
+  responseShape = (rows) => rows;
 
   /* ------------------------------------------------------------------ */
   section('Choosing datasets');

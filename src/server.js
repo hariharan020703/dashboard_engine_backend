@@ -124,7 +124,38 @@ async function start() {
   });
 }
 
+/*
+ * Last-resort logging for a fatal error.
+ *
+ * Node's default for an unhandled rejection or an uncaught exception is to
+ * print and exit, which is the right behaviour - a process in an unknown state
+ * should not keep serving. What it is not is diagnosable when the output goes
+ * somewhere nobody is watching: the symptom is "the backend stopped", with an
+ * empty log and no stack.
+ *
+ * These change nothing about the outcome. They make the reason survive it.
+ */
+function die(kind, err) {
+  const detail = err instanceof Error ? err.stack || err.message : JSON.stringify(err);
+  console.error(`[fatal] ${kind}: ${detail}`);
+  // Flushed before exiting: stderr to a pipe is asynchronous on some platforms,
+  // and exiting immediately is how the stack gets lost in the first place.
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 100).unref();
+}
+
+process.on('unhandledRejection', (err) => die('unhandled promise rejection', err));
+process.on('uncaughtException', (err) => die('uncaught exception', err));
+
+// Not errors, but worth a line: without one, a stop looks identical to a crash.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    console.log(`[shutdown] received ${signal}`);
+    process.exit(0);
+  });
+}
+
 start().catch((err) => {
-  console.error('[startup] failed:', err.message);
+  console.error('[startup] failed:', err.stack || err.message);
   process.exit(1);
 });

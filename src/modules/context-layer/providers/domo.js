@@ -26,13 +26,66 @@ const { fail } = require('../../../api/response');
  */
 
 const WHOAMI_PATH = '/api/content/v2/users/me';
-const DATASET_SEARCH_PATH = '/api/data/ui/v3/datasources/search';
 
-/** One page of dataset results. Domo caps this; 100 is comfortably inside it. */
-const PAGE_SIZE = 100;
-/** Stops a misconfigured instance from being walked indefinitely. */
-const MAX_PAGES = 50;
+/*
+ * The dataset list.
+ *
+ * A GET that returns a plain JSON array of datasources, rather than the UI's
+ * POST search endpoint: the search endpoint takes a body whose shape is tied
+ * to the UI's own filter model, and getting that body subtly wrong returns a
+ * successful, empty result - which is indistinguishable from an account that
+ * genuinely has no datasets. This one has no body to get wrong.
+ */
+const DATASET_LIST_PATH = '/api/data/v3/datasources';
+
+/*
+ * Domo enforces a hard cap of 50 and answers 400 above it:
+ *
+ *   'limit' param must be nonnegative and <= 50. actual=100
+ *
+ * Not a guess - that is the instance's own message, which is why the page size
+ * is a named constant rather than a number inlined into the query.
+ */
+const PAGE_SIZE = 50;
+
+/** Stops a misconfigured instance from being walked indefinitely: 5000 datasets. */
+const MAX_PAGES = 100;
 const REQUEST_TIMEOUT_MS = 20000;
+
+/*
+ * Which blocks of each datasource Domo should include.
+ *
+ * `part` is not optional decoration: without `rowcolcount` the response
+ * carries no rowCount or columnCount, and the picker loses the one number
+ * that tells a real dataset from an empty shell. The rest is what Domo's own
+ * data centre asks for, kept as a list so a field that turns out to be missing
+ * has an obvious place to be added.
+ */
+const DATASET_PARTS = [
+  'core', 'permission', 'status', 'pdp', 'rowcolcount', 'certification',
+  'sharecount', 'alertcount', 'dataprovider', 'features', 'impactcounts',
+  'functions', 'cryo', 'warnings', 'pharos',
+].join(',');
+
+/*
+ * Built by hand rather than with URLSearchParams: the commas in `part` are
+ * legal unencoded, and percent-encoding them is a needless difference from the
+ * request Domo's own client sends.
+ *
+ * `orderBy=createdAt` gives paging a stable order. Sorting by name would be
+ * friendlier, but the display order is decided below after every page is in -
+ * what matters here is that the sequence does not shift between requests and
+ * silently skip a row.
+ */
+function datasetPageQuery(page) {
+  return (
+    `?limit=${PAGE_SIZE}` +
+    `&offset=${page * PAGE_SIZE}` +
+    `&part=${DATASET_PARTS}` +
+    '&includeHidden=true' +
+    '&orderBy=createdAt'
+  );
+}
 
 /**
  * Normalises whatever was typed into a bare hostname.
@@ -156,10 +209,36 @@ function shapeDataset(row) {
 }
 
 /**
+ * Finds the array of datasources in whatever Domo sent back.
+ *
+ * Returns null when there is no recognisable array, which the caller turns
+ * into an error. It deliberately does NOT fall back to an empty list: "I do
+ * not understand this response" and "this account has no datasets" look
+ * identical on screen, and conflating them is how a wrong endpoint reads as a
+ * working connection to an empty warehouse.
+ */
+function extractRows(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== 'object') return null;
+
+  for (const key of ['dataSources', 'datasources', 'searchObjects', 'results', 'items']) {
+    if (Array.isArray(payload[key])) return payload[key];
+  }
+  // The newer search response nests results by entity type.
+  const byEntity = payload.searchResultsMap;
+  if (byEntity && typeof byEntity === 'object') {
+    for (const value of Object.values(byEntity)) {
+      if (Array.isArray(value)) return value;
+    }
+  }
+  return null;
+}
+
+/**
  * Every dataset the token can see, paged until Domo stops returning rows.
  *
  * The loop stops on three conditions rather than one - a short page, an empty
- * page, or the page cap - because a search API that ignores `offset` would
+ * page, or the page cap - because an endpoint that ignores `offset` would
  * otherwise return page one forever.
  */
 async function listDatasets({ host, token }) {
@@ -167,31 +246,35 @@ async function listDatasets({ host, token }) {
   const seen = new Set();
 
   for (let page = 0; page < MAX_PAGES; page++) {
-    const payload = await callDomo(host, token, DATASET_SEARCH_PATH, {
-      method: 'POST',
-      body: {
-        entities: ['DATASET'],
-        filters: [],
-        combineResults: true,
-        query: '',
-        count: PAGE_SIZE,
-        offset: page * PAGE_SIZE,
-      },
-    });
+    const payload = await callDomo(host, token, DATASET_LIST_PATH + datasetPageQuery(page));
 
-    const rows = (payload && (payload.dataSources || payload.searchObjects || payload.results)) || [];
-    if (!Array.isArray(rows)) {
+    const rows = extractRows(payload);
+    if (rows === null) {
+      /*
+       * Logged as well as thrown. The message has to stay short enough to read
+       * on screen, but fixing a changed response shape needs to see the shape -
+       * and this is a list of datasets, so there is no credential in it.
+       */
+      const shape = payload && typeof payload === 'object'
+        ? Object.keys(payload).join(', ') || '(no keys)'
+        : typeof payload;
+      console.error(
+        `[domo] unrecognised response from ${DATASET_LIST_PATH} - keys: ${shape}
+` +
+        `[domo] sample: ${JSON.stringify(payload).slice(0, 600)}`
+      );
       throw fail(
         'CONNECTOR_UNREACHABLE',
-        `${host} returned an unexpected shape from ${DATASET_SEARCH_PATH}. ` +
-        'The instance API may have changed; see providers/domo.js.'
+        `${host} answered ${DATASET_LIST_PATH} with something this connector does not ` +
+        `recognise (fields: ${shape}). The instance API may have changed - the server log ` +
+        'has the response, and providers/domo.js is the only file that needs to change.'
       );
     }
 
     let added = 0;
     for (const row of rows) {
       const dataset = shapeDataset(row);
-      // A search that ignores the offset repeats itself; deduplicating by id
+      // An endpoint that ignores the offset repeats itself; deduplicating by id
       // means that shows up as "no new rows" and ends the loop.
       if (!dataset || seen.has(dataset.id)) continue;
       seen.add(dataset.id);
@@ -202,7 +285,9 @@ async function listDatasets({ host, token }) {
     if (rows.length < PAGE_SIZE || added === 0) break;
   }
 
-  datasets.sort((a, b) => a.name.localeCompare(b.name));
+  // String(): a name that arrives as a number has no localeCompare, and a
+  // TypeError thrown from inside sort() is a 500 with a baffling stack.
+  datasets.sort((a, b) => String(a.name).localeCompare(String(b.name)));
   return datasets;
 }
 
