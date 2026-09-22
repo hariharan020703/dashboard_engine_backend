@@ -4,6 +4,7 @@ const access = require('../auth/accessService');
 const users = require('../auth/userService');
 const groups = require('../auth/groupService');
 const companies = require('../auth/companyService');
+const { ACCESS_LEVELS, ACCESS_LEVEL_LABELS } = require('../auth/permissionCatalogue');
 const { resolveTargetCompany } = require('../auth/authorization');
 const { audit, EVENTS } = require('../auth/auditService');
 const {
@@ -43,6 +44,20 @@ async function resolveGrantTarget(actor, requestedCompanyId, dashboardId) {
 }
 
 /* ------------------------------------------------------------------ reads --- */
+
+/*
+ * GET /api/access/levels - what each per-dashboard level means, in words.
+ *
+ * Lives here rather than under /api/platform/roles because it is the vocabulary
+ * a COMPANY_ADMIN's access screens render: they hand out levels, so they need
+ * the labels. Role and permission MANAGEMENT stayed platform-only; describing a
+ * level is not management.
+ *
+ * Ranked weakest first, which is the order the pickers show them in.
+ */
+router.get('/levels', requirePermission('access.read'), (req, res) => {
+  ok(res, ACCESS_LEVELS.map((id) => ({ id, description: ACCESS_LEVEL_LABELS[id] })));
+});
 
 // GET /api/access/dashboards - the dashboards the caller may open
 router.get('/dashboards', async (req, res) => {

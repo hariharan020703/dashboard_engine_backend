@@ -32,6 +32,13 @@
 const { startSmtpSink } = require('./smtpSink');
 const { createReportingFixture } = require('./reportingFixture');
 const { BOOTSTRAP_SUPERADMIN } = require('../src/config/appConfig');
+/*
+ * Read rather than restated, so the link assertion below follows the same
+ * configuration the server built the link from. Hardcoding the URL made this
+ * suite fail whenever it ran against a server on a different address, which is
+ * a property of the harness rather than of the product.
+ */
+const { APPLICATION_URL } = require('../src/config/auth');
 
 const BASE = process.env.E2E_BASE || 'http://localhost:8099';
 const SINK_PORT = Number(process.env.E2E_SMTP_PORT || 2525);
@@ -150,7 +157,7 @@ function activationTokenFrom(email) {
   check('refresh cookie was set HttpOnly', owner.cookies.has('da_refresh'));
   owner.adopt(r.body.data);
 
-  r = await owner.call('GET', '/api/companies');
+  r = await owner.call('GET', '/api/platform/companies');
   check('blocked from other endpoints until the change', r.status === 403 && r.body?.error?.code === 'PASSWORD_CHANGE_REQUIRED', JSON.stringify(r.body));
 
   r = await owner.call('POST', '/api/auth/change-password', {
@@ -161,16 +168,16 @@ function activationTokenFrom(email) {
   check('state becomes AUTHENTICATED', r.body?.data?.state === 'AUTHENTICATED');
   owner.adopt(r.body.data);
 
-  r = await owner.call('GET', '/api/companies');
+  r = await owner.call('GET', '/api/platform/companies');
   check('platform endpoints now reachable', r.status === 200, JSON.stringify(r.body));
 
   /* ------------------------------------------------------------------ */
   section('Platform owner: companies and company administrators');
 
-  r = await owner.call('POST', '/api/companies', { name: 'No Admin Ltd' });
+  r = await owner.call('POST', '/api/platform/companies', { name: 'No Admin Ltd' });
   check('company without an administrator is refused', r.status === 400 && r.body?.error?.code === 'VALIDATION_ERROR', JSON.stringify(r.body));
 
-  r = await owner.call('POST', '/api/companies', {
+  r = await owner.call('POST', '/api/platform/companies', {
     name: 'Alpha Industries',
     admin: { username: 'alpha.admin', email: 'alpha.admin@example.com', displayName: 'Alpha Admin' },
   });
@@ -182,7 +189,7 @@ function activationTokenFrom(email) {
   check('new account is pending', r.body?.data?.admin?.status === 'pending');
   check('response contains no password field', !JSON.stringify(r.body).includes('password_hash') && !('password' in (r.body?.data?.admin || {})));
 
-  r = await owner.call('POST', '/api/companies', {
+  r = await owner.call('POST', '/api/platform/companies', {
     name: 'Beta Corp',
     admin: { username: 'beta.admin', email: 'beta.admin@example.com' },
   });
@@ -194,16 +201,16 @@ function activationTokenFrom(email) {
    * The username collides, so the whole transaction rolls back - and the proof
    * is that the same company name is still free afterwards.
    */
-  r = await owner.call('POST', '/api/companies', {
+  r = await owner.call('POST', '/api/platform/companies', {
     name: 'Rollback Test Ltd',
     admin: { username: 'alpha.admin', email: 'someone.else@example.com' },
   });
   check('duplicate administrator is refused', r.status === 409 && r.body?.error?.code === 'CONFLICT', JSON.stringify(r.body));
 
-  r = await owner.call('GET', '/api/companies');
+  r = await owner.call('GET', '/api/platform/companies');
   check('the rejected company was not created', !(r.body?.data || []).some((c) => c.name === 'Rollback Test Ltd'), JSON.stringify(r.body));
 
-  r = await owner.call('PUT', `/api/companies/${companyA}/dashboards/default`);
+  r = await owner.call('PUT', `/api/platform/companies/${companyA}/dashboards/default`);
   check('assigns the dashboard to company A', r.status === 200, JSON.stringify(r.body));
 
   /* ------------------------------------------------------------------ */
@@ -211,7 +218,7 @@ function activationTokenFrom(email) {
 
   const mail = latestEmail('alpha.admin@example.com');
   check('activation email was written', Boolean(mail));
-  check('email contains the application URL', (mail || '').includes('http://localhost:5173'));
+  check('email contains the application URL', (mail || '').includes(APPLICATION_URL), APPLICATION_URL);
   check('email contains the username', (mail || '').includes('alpha.admin'));
   check('email contains a security notice', /Security notice/i.test(mail || ''));
   check('email contains first-login instructions', /First sign-in/i.test(mail || ''));
@@ -241,11 +248,24 @@ function activationTokenFrom(email) {
   r = await alphaAdmin.call('GET', '/api/users');
   check('sees only their company', r.status === 200 && r.body.data.every((u) => u.companyId === companyA), JSON.stringify(r.body?.data?.map((u) => u.username)));
 
-  r = await alphaAdmin.call('GET', '/api/companies');
-  check('sees only their own company', r.status === 200 && r.body.data.length === 1 && r.body.data[0].id === companyA);
+  // The tenant namespace answers about the caller's own company, and takes no
+  // company id at all - so there is nothing here to point at another tenant.
+  r = await alphaAdmin.call('GET', '/api/workspace/company');
+  check('reads their own company', r.status === 200 && r.body.data?.id === companyA, JSON.stringify(r.body));
 
-  r = await alphaAdmin.call('POST', '/api/companies', { name: 'Sneaky Ltd' });
-  check('cannot create a company', r.status === 403 && r.body?.error?.code === 'INSUFFICIENT_PERMISSION');
+  r = await alphaAdmin.call('GET', '/api/workspace/overview');
+  check('own-company counts are scoped to them', r.status === 200 && r.body.data?.company?.id === companyA, JSON.stringify(r.body));
+
+  // The whole platform namespace is refused on role scope, before any
+  // permission is consulted.
+  r = await alphaAdmin.call('GET', '/api/platform/companies');
+  check('cannot list every company', r.status === 403 && r.body?.error?.code === 'TENANT_ACCESS_DENIED', JSON.stringify(r.body));
+
+  r = await alphaAdmin.call('POST', '/api/platform/companies', { name: 'Sneaky Ltd' });
+  check('cannot create a company', r.status === 403 && r.body?.error?.code === 'TENANT_ACCESS_DENIED', JSON.stringify(r.body));
+
+  r = await alphaAdmin.call('GET', '/api/platform/users');
+  check('cannot read the cross-tenant directory', r.status === 403 && r.body?.error?.code === 'TENANT_ACCESS_DENIED', JSON.stringify(r.body));
 
   r = await alphaAdmin.call('POST', '/api/users', {
     username: 'alpha.user', email: 'alpha.user@example.com', role: 'USER',
@@ -267,7 +287,7 @@ function activationTokenFrom(email) {
   check('cannot create a SUPER_ADMIN', r.status === 403 && r.body?.error?.code === 'INSUFFICIENT_PERMISSION', JSON.stringify(r.body));
 
   // Find company B's admin id by asking as the owner, then try to reach it.
-  r = await owner.call('GET', `/api/users?companyId=${companyB}`);
+  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}`);
   const betaAdminId = r.body.data.find((u) => u.username === 'beta.admin').id;
 
   r = await alphaAdmin.call('GET', `/api/users/${betaAdminId}`);
@@ -279,7 +299,7 @@ function activationTokenFrom(email) {
   r = await alphaAdmin.call('DELETE', `/api/users/${betaAdminId}`);
   check('cannot delete another company\u2019s user', r.status === 404);
 
-  r = await owner.call('GET', '/api/users');
+  r = await owner.call('GET', '/api/platform/users');
   const ownerId = r.body.data.find((u) => u.role === 'SUPER_ADMIN').id;
   r = await alphaAdmin.call('PATCH', `/api/users/${ownerId}`, { role: 'USER' });
   check('cannot manage the platform owner', r.status === 404 || r.status === 403, `${r.status} ${JSON.stringify(r.body)}`);
@@ -327,10 +347,13 @@ function activationTokenFrom(email) {
   r = await alphaUser.call('POST', '/api/users', { username: 'x.y', email: 'x@y.com', role: 'USER' });
   check('user cannot create users', r.status === 403);
 
-  r = await alphaUser.call('GET', '/api/companies');
-  check('user cannot read companies', r.status === 403);
+  r = await alphaUser.call('GET', '/api/workspace/company');
+  check('user cannot read their own company either', r.status === 403 && r.body?.error?.code === 'INSUFFICIENT_PERMISSION', JSON.stringify(r.body));
 
-  r = await alphaUser.call('PUT', '/api/roles/USER/permissions', { permissions: [] });
+  r = await alphaUser.call('GET', '/api/platform/companies');
+  check('user cannot reach the platform namespace', r.status === 403 && r.body?.error?.code === 'TENANT_ACCESS_DENIED', JSON.stringify(r.body));
+
+  r = await alphaUser.call('PUT', '/api/platform/roles/USER/permissions', { permissions: [] });
   check('user cannot edit role permissions', r.status === 403);
 
   r = await alphaUser.call('PATCH', '/api/dashboard/default/config', { index: 0, card: {} });
@@ -359,7 +382,7 @@ function activationTokenFrom(email) {
   check('their own user can be added as a member', r.status === 200, JSON.stringify(r.body));
 
   // The guard that stops group membership breaching the tenant boundary.
-  r = await owner.call('GET', `/api/users?companyId=${companyB}`);
+  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}`);
   const betaUserId = r.body.data.find((u) => u.username === 'beta.admin').id;
   r = await alphaAdmin.call('PUT', `/api/groups/${groupId}`, { userIds: [betaUserId] });
   check(
@@ -413,15 +436,15 @@ function activationTokenFrom(email) {
   /* ------------------------------------------------------------------ */
   section('Role permissions and the platform boundary');
 
-  r = await owner.call('PUT', '/api/roles/COMPANY_ADMIN/permissions', {
+  r = await owner.call('PUT', '/api/platform/roles/COMPANY_ADMIN/permissions', {
     permissions: ['user.read', 'company.create'],
   });
   check('a company role cannot be given a platform permission', r.status === 400 && r.body?.error?.code === 'VALIDATION_ERROR', JSON.stringify(r.body));
 
-  r = await owner.call('PUT', '/api/roles/SUPER_ADMIN/permissions', { permissions: [] });
+  r = await owner.call('PUT', '/api/platform/roles/SUPER_ADMIN/permissions', { permissions: [] });
   check('SUPER_ADMIN permissions cannot be edited', r.status === 400, JSON.stringify(r.body));
 
-  r = await owner.call('PUT', '/api/roles/USER/permissions', { permissions: ['dashboard.read', 'data.read'] });
+  r = await owner.call('PUT', '/api/platform/roles/USER/permissions', { permissions: ['dashboard.read', 'data.read'] });
   check('USER permissions can be edited', r.status === 200, JSON.stringify(r.body));
 
   /* ------------------------------------------------------------------ */
@@ -479,7 +502,7 @@ function activationTokenFrom(email) {
   r = await disabled.call('POST', '/api/auth/login', { identifier: 'alpha.user', password: 'AlphaUser1!' });
   check('deactivated account cannot sign in', r.status === 403 && r.body?.error?.code === 'ACCOUNT_DISABLED', JSON.stringify(r.body));
 
-  r = await owner.call('PATCH', `/api/companies/${companyA}`, { active: false });
+  r = await owner.call('PATCH', `/api/platform/companies/${companyA}`, { active: false });
   check('owner deactivates company A', r.status === 200);
 
   const blocked = client('blocked');
@@ -489,7 +512,7 @@ function activationTokenFrom(email) {
   r = await alphaAdmin.call('GET', '/api/users');
   check('live session in a disabled company is dropped', r.status === 403 && r.body?.error?.code === 'COMPANY_DISABLED', `${r.status} ${JSON.stringify(r.body)}`);
 
-  await owner.call('PATCH', `/api/companies/${companyA}`, { active: true });
+  await owner.call('PATCH', `/api/platform/companies/${companyA}`, { active: true });
 
   /* ------------------------------------------------------------------ */
   section('Unauthenticated and malformed requests');
@@ -498,7 +521,11 @@ function activationTokenFrom(email) {
   for (const [method, url] of [
     ['GET', '/api/dashboard/default'],
     ['GET', '/api/users'],
-    ['GET', '/api/companies'],
+    ['GET', '/api/groups'],
+    ['GET', '/api/workspace/company'],
+    ['GET', '/api/platform/companies'],
+    ['GET', '/api/platform/users'],
+    ['GET', '/api/platform/audit'],
     ['GET', '/api/dashboard/columns?dashboardId=default'],
     ['POST', '/api/dashboard/preview'],
   ]) {
@@ -514,7 +541,7 @@ function activationTokenFrom(email) {
   r = await anon.call('GET', '/api/nope', undefined, { noAuth: true });
   check('unknown endpoint is a structured 404', r.status === 404 && r.body?.success === false && r.body?.error?.code === 'RESOURCE_NOT_FOUND');
 
-  r = await owner.call('GET', '/api/users/abc');
+  r = await owner.call('GET', '/api/platform/users/abc');
   check('a non-numeric id is a validation error', r.status === 400 && r.body?.error?.code === 'VALIDATION_ERROR');
 
   /* ------------------------------------------------------------------ */

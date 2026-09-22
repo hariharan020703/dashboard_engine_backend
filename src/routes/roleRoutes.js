@@ -5,8 +5,6 @@ const {
   ALL_PERMISSIONS,
   ALL_PERMISSION_IDS,
   PLATFORM_ONLY_PERMISSIONS,
-  ACCESS_LEVELS,
-  ACCESS_LEVEL_LABELS,
   ROLE_SCOPES,
   SUPER_ADMIN,
 } = require('../auth/permissionCatalogue');
@@ -36,21 +34,18 @@ router.use(requireRbac, requireAuth, requirePasswordCurrent);
 // Literal paths first: /permissions must not be read as a role name.
 
 /*
- * GET /api/roles/permissions - the catalogue the role editor renders.
+ * GET /api/platform/roles/permissions - the catalogue the role editor renders.
  *
- * Available to anyone who may read roles, including a company administrator:
- * it is the vocabulary, not a grant, and their screens label permissions with it.
+ * Platform-only, like the rest of this router: it describes the permission
+ * MODEL, which is a product concern. The vocabulary a company administrator's
+ * screens need to label the access they hand out is the per-dashboard levels,
+ * and those are served from /api/access/levels inside the tenant namespace.
  */
 router.get('/permissions', requirePermission('role.read'), (req, res) => {
   ok(res, ALL_PERMISSIONS.map((p) => ({ ...p, platformOnly: PLATFORM_ONLY_PERMISSIONS.has(p.id) })));
 });
 
-// GET /api/roles/access-levels - the per-dashboard levels, ranked weakest first
-router.get('/access-levels', requirePermission('role.read'), (req, res) => {
-  ok(res, ACCESS_LEVELS.map((id) => ({ id, description: ACCESS_LEVEL_LABELS[id] })));
-});
-
-// GET /api/roles - the three roles, with how many accounts hold each
+// GET /api/platform/roles - the three roles, with how many accounts hold each
 router.get('/', requirePermission('role.read'), async (req, res) => {
   const { rows } = await db.query(
     `SELECT r.name, r.scope, r.description,
@@ -61,7 +56,7 @@ router.get('/', requirePermission('role.read'), async (req, res) => {
   ok(res, rows.map((r) => ({ ...r, userCount: Number(r.userCount) })));
 });
 
-// GET /api/roles/:name/permissions - the permissions a role holds
+// GET /api/platform/roles/:name/permissions - the permissions a role holds
 router.get('/:name/permissions', requirePermission('role.read'), async (req, res) => {
   const role = await findRole(req.params.name);
   if (!role) throw fail('RESOURCE_NOT_FOUND', 'Role not found');
@@ -85,7 +80,7 @@ router.get('/:name/permissions', requirePermission('role.read'), async (req, res
 });
 
 /*
- * PUT /api/roles/:name/permissions - replace a role's permission set.
+ * PUT /api/platform/roles/:name/permissions - replace a role's permission set.
  *
  * Platform-only, because changing what COMPANY_ADMIN may do is a change to the
  * product's boundaries rather than to one customer's configuration.

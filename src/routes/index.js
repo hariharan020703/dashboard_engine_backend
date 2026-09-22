@@ -4,14 +4,13 @@ const { sendError, ok } = require('../api/response');
 const { isRbacReady, rbacError } = require('../auth/appMetaSchema');
 const { describeTransport } = require('../email/emailService');
 const authRoutes = require('./authRoutes');
-const companyRoutes = require('./companyRoutes');
+const platformRoutes = require('./platformRoutes');
+const workspaceRoutes = require('./workspaceRoutes');
 const userRoutes = require('./userRoutes');
-const roleRoutes = require('./roleRoutes');
 const groupRoutes = require('./groupRoutes');
 const accessRoutes = require('./accessRoutes');
 const dashboardRoutes = require('./dashboardRoutes');
 const metadataRoutes = require('./metadataRoutes');
-const auditRoutes = require('./auditRoutes');
 const contextLayerRoutes = require('../modules/context-layer/routes');
 
 /** Everything under /api. Mounted by the server as a single unit. */
@@ -34,18 +33,30 @@ router.get('/health', (req, res) => {
 });
 
 /*
- * Every router below enforces its own guards - see middleware/auth.js. There is
- * no longer an unguarded namespace: the dashboard and editor routes used to be
- * open to anonymous callers and are now behind the same actor resolution and
- * the same per-dashboard access check as everything else.
+ * The API is split into two namespaces by the SCOPE of what they operate on.
+ *
+ *   /api/platform/*   crosses tenants: the company directory, the cross-tenant
+ *                     user directory, the permission model, the audit trail.
+ *                     Gated as a whole by requirePlatform.
+ *
+ *   /api/*            is one tenant's: their team, their groups, their grants,
+ *                     their dashboards, their connections. The company comes
+ *                     from req.actor, so these routes answer about the caller's
+ *                     own company whoever calls them.
+ *
+ * The URL therefore says which boundary a request is asking to cross, which is
+ * the thing an audit log reader, a proxy rule and a reviewer all want to know
+ * first. It is not a second authorization mechanism: every router below still
+ * enforces its own permissions and its own company filter, and /api/platform
+ * mounts several of these same router objects rather than cloning them.
  */
 router.use('/auth', authRoutes);
-router.use('/companies', companyRoutes);
+router.use('/platform', platformRoutes);
+
+router.use('/workspace', workspaceRoutes);
 router.use('/users', userRoutes);
-router.use('/roles', roleRoutes);
 router.use('/groups', groupRoutes);
 router.use('/access', accessRoutes);
-router.use('/audit', auditRoutes);
 
 // Feature modules live under src/modules and are mounted as whole units, so
 // adding or removing one touches this line and nothing else.

@@ -1,34 +1,25 @@
 const express = require('express');
 const fs = require('fs');
 const readline = require('readline');
-const { ok, fail } = require('../api/response');
+const { ok } = require('../api/response');
 const { AUDIT_FILE } = require('../auth/auditService');
-const {
-  requireRbac,
-  requireAuth,
-  requirePasswordCurrent,
-} = require('../middleware/auth');
 
 /**
  * Audit log inspection for the platform owner.
  *
  * Reads append-only entries from the audit file and returns the most recent
- * entries as structured JSON objects. Access is restricted strictly to platform
- * accounts.
+ * ones as structured JSON.
+ *
+ * This router declares no guards of its own. It is mounted only inside
+ * /api/platform, which already applies requireRbac, requireAuth,
+ * requirePasswordCurrent and requirePlatform to everything below it - and it
+ * used to carry a second, local copy of the platform check. Two guards enforcing
+ * the same rule is how one of them gets relaxed later without the other, so the
+ * mount is now the single place that decides who reaches this.
  */
 const router = express.Router();
 
-router.use(requireRbac, requireAuth, requirePasswordCurrent);
-
-function requirePlatform(req, res, next) {
-  if (!req.actor || !req.actor.isPlatform) {
-    return next(fail('TENANT_ACCESS_DENIED', 'Only platform administrators can access audit records.'));
-  }
-  next();
-}
-
-router.use(requirePlatform);
-
+// GET /api/platform/audit - the most recent audit entries, newest first
 router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
 

@@ -8,10 +8,11 @@ const { assertDashboardLevel } = require('../auth/accessService');
 const { audit, EVENTS } = require('../auth/auditService');
 
 /**
- * Request-level enforcement. Four guards, composed left to right on a route:
+ * Request-level enforcement. Five guards, composed left to right on a route:
  *
  *   requireRbac              the metadata database is up
  *   requireAuth              a valid access token, resolved to a live account
+ *   requirePlatform          that account is not bounded by a company
  *   requirePermission(id)    that account's role holds a permission
  *   requireDashboard(level)  that account holds a level on :dashboardId
  *
@@ -104,6 +105,30 @@ function requirePasswordCurrent(req, res, next) {
   next();
 }
 
+/**
+ * Restricts a route to platform accounts.
+ *
+ * This is the guard on the whole /api/platform namespace, and it is about the
+ * ROLE SCOPE rather than about any one permission: the endpoints below it
+ * operate across tenants, so "may read users" is not the question - "is this
+ * caller bounded by a company" is. Permissions still apply underneath; a
+ * platform account without `company.create` is still refused by the route.
+ *
+ * It reads actor.isPlatform, which buildActor derives from the role's scope in
+ * the catalogue, so this is not a role-name comparison in disguise.
+ */
+function requirePlatform(req, res, next) {
+  if (!req.actor) return next(fail('UNAUTHENTICATED', 'Sign in to continue.'));
+  if (req.actor.isPlatform) return next();
+
+  audit(EVENTS.ACCESS_DENIED, req.actor, {
+    reason: 'platform_only',
+    method: req.method,
+    path: req.originalUrl.split('?')[0],
+  });
+  next(fail('TENANT_ACCESS_DENIED', 'This area is restricted to platform administrators.'));
+}
+
 /** Gate a route on one permission from auth/permissionCatalogue.js. */
 function requirePermission(permission) {
   return function permissionGuard(req, res, next) {
@@ -158,6 +183,7 @@ module.exports = {
   requireRbac,
   requireAuth,
   requirePasswordCurrent,
+  requirePlatform,
   requirePermission,
   requireDashboardAccess,
   actorFromToken,
