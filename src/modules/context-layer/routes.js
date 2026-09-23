@@ -24,6 +24,34 @@ const router = express.Router();
 
 router.use(requireRbac, requireAuth, requirePasswordCurrent);
 
+/**
+ * How many datasets a listing may return.
+ *
+ * Absent means the provider's default, which is a first page rather than
+ * everything: listing is the slowest thing a connector does, and an instance
+ * with thousands of datasets is dozens of round trips before the picker can
+ * draw anything.
+ *
+ * A bad value is refused rather than quietly clamped. `?limit=abc` and
+ * `?limit=-5` are a client bug, and a listing that silently returns a
+ * different amount than was asked for is the kind of thing that gets noticed
+ * weeks later as "sometimes it only shows twenty".
+ */
+const MAX_DATASET_LIMIT = 500;
+
+function readLimit(raw) {
+  if (raw === undefined || raw === '') return undefined;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_DATASET_LIMIT) {
+    throw fail(
+      'VALIDATION_ERROR',
+      `limit must be a whole number between 1 and ${MAX_DATASET_LIMIT} (got "${raw}").`
+    );
+  }
+  return value;
+}
+
 /* ------------------------------------------------------------- catalogue --- */
 
 // GET /api/context/connectors - what can be connected, and what is coming
@@ -75,6 +103,7 @@ router.post('/connections', requirePermission('context.manage'), async (req, res
     name,
     host,
     token,
+    limit: readLimit((req.body || {}).limit),
   });
 
   audit(EVENTS.CONTEXT_CONNECTION_CREATED, req.actor, {
@@ -83,7 +112,11 @@ router.post('/connections', requirePermission('context.manage'), async (req, res
     name: result.connection.name,
     host: result.connection.host,
     companyId,
-    datasetsVisible: result.datasets.length,
+    // "how many were listed", not "how many exist" - the listing is capped, so
+    // recording it as a total would put a wrong number in the audit trail.
+    datasetsListed: result.datasets.length,
+    datasetLimit: result.limit,
+    datasetsTruncated: result.truncated,
   });
 
   ok(res, result, 201);
@@ -107,9 +140,46 @@ router.post('/connections/:id/verify', requirePermission('context.manage'), asyn
  * somewhere else, for a reason invisible from this screen.
  */
 router.get('/connections/:id/datasets', requirePermission('context.read'), async (req, res) => {
-  const datasets = await connections.fetchDatasets(req.actor, req.params.id);
-  ok(res, { datasets, fetchedAt: new Date().toISOString() });
+  const limit = readLimit(req.query.limit);
+  const listing = await connections.fetchDatasets(req.actor, req.params.id, { limit });
+  ok(res, {
+    datasets: listing.datasets,
+    fetchedAt: new Date().toISOString(),
+    // Echoed so the client shows the limit that was actually applied rather
+    // than the one it asked for - they differ whenever it asked for too much.
+    limit: listing.limit,
+    // True only when the warehouse was proven to hold at least one more.
+    truncated: listing.truncated,
+  });
 });
+
+/*
+ * GET /api/context/connections/:id/profile - the Profile step's tree.
+ *
+ * Served from this database rather than the warehouse: the counts were
+ * captured when the datasets were chosen, so the tree draws immediately and a
+ * warehouse that is briefly unreachable does not empty the screen. Anything
+ * that has to be current is fetched per table, below.
+ */
+router.get('/connections/:id/profile', requirePermission('context.read'), async (req, res) => {
+  ok(res, await connections.profileOverview(req.actor, req.params.id));
+});
+
+/*
+ * GET /api/context/connections/:id/tables/:tableId - one table, live.
+ *
+ * Structure and statistics read from the warehouse itself - columns, types,
+ * null rates, distinct counts, a row sample. None of it is generated: this is
+ * what the source says about its own data, which is why it is a separate step
+ * from the AI's interpretation of it.
+ */
+router.get(
+  '/connections/:id/tables/:tableId',
+  requirePermission('context.read'),
+  async (req, res) => {
+    ok(res, await connections.tableProfile(req.actor, req.params.id, req.params.tableId));
+  }
+);
 
 /*
  * PUT /api/context/connections/:id/datasets - record the chosen datasets.

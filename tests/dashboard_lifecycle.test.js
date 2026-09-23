@@ -91,6 +91,23 @@ async function runTests() {
   const dashA_Id = 'test-dash-corp-a';
   const dashB_Id = 'test-dash-corp-b';
 
+  // Ensure test companies and users exist
+  await db.query(
+    `INSERT INTO ${T.companies} (id, name, slug)
+     VALUES
+       (9991, 'Test Corp A', 'test-corp-a'),
+       (9992, 'Test Corp B', 'test-corp-b')
+     ON CONFLICT (id) DO NOTHING`
+  );
+  await db.query(
+    `INSERT INTO ${T.users} (id, company_id, username, email, role, status)
+     VALUES
+       (8881, 9991, 'testuser_a', 'user_a@test.com', 'COMPANY_ADMIN', 'active'),
+       (8882, 9992, 'testuser_b', 'user_b@test.com', 'COMPANY_ADMIN', 'active'),
+       (8883, 9991, 'testuser_user_a', 'user_user_a@test.com', 'USER', 'active')
+     ON CONFLICT (id) DO NOTHING`
+  );
+
   // Clean up any old test records
   await registry.deleteDashboard(dashA_Id).catch(() => {});
   await registry.deleteDashboard(dashB_Id).catch(() => {});
@@ -160,6 +177,11 @@ async function runTests() {
 
   await registry.deleteDashboard(dashB_Id);
   console.log('  ✓ Cleaned up test dashboards');
+
+  // Clean up test users and companies
+  await db.query(`DELETE FROM ${T.users} WHERE id IN (8881, 8882, 8883)`);
+  await db.query(`DELETE FROM ${T.companies} WHERE id IN (9991, 9992)`);
+  console.log('  ✓ Cleaned up test users and companies');
 
   console.log('\n=== All Multi-Tenant Dashboard Architecture Tests PASSED! ===');
   process.exit(0);

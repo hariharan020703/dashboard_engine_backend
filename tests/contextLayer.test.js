@@ -110,6 +110,39 @@ function installFakeDomo() {
       return json({ id: 42, displayName: 'Ada Lovelace', emailAddress: 'ada@example.com' });
     }
 
+    // One dataset's own record. Everything the Profile step's header shows.
+    const detail = target.pathname.match(/^\/api\/data\/v3\/datasources\/(.+)$/);
+    if (detail) {
+      return json({
+        id: detail[1],
+        name: `Dataset ${detail[1]}`,
+        description: 'A stand-in dataset',
+        rowCount: 4200,
+        columnCount: 3,
+        sizeInBytes: 2576980377,
+        lastTouched: '2026-09-20T10:00:00.000Z',
+        owner: { name: 'Ada Lovelace' },
+      });
+    }
+
+    /*
+     * Domo's SQL surface. `metadata` parallel to `columns` is the only place
+     * this API exposes per-column types at all, which is why the profile has
+     * to run a query rather than read the record above.
+     */
+    if (target.pathname.startsWith('/api/query/v1/execute/')) {
+      return json({
+        columns: ['id', 'region', 'revenue'],
+        metadata: [{ type: 'LONG' }, { type: 'STRING' }, { type: 'DOUBLE' }],
+        rows: [
+          [1, 'North', 10.5],
+          [2, 'South', 20.5],
+          [3, null, 30.5],
+          [4, 'North', null],
+        ],
+      });
+    }
+
     if (target.pathname === '/api/data/v3/datasources') {
       const limit = Number(target.searchParams.get('limit'));
       const offset = Number(target.searchParams.get('offset'));
@@ -277,17 +310,19 @@ async function cleanup() {
   section('Listing datasets');
 
   datasetCount = 3;
-  const listed = await service.fetchDatasets(adminA, connectionId);
+  const listing = await service.fetchDatasets(adminA, connectionId);
+  const listed = listing.datasets;
   check('the datasets are listed', listed.length === 3, String(listed.length));
   check('each carries the id a context needs', listed.every((d) => typeof d.id === 'string' && d.id));
   check('row counts are numbers', listed.every((d) => typeof d.rowCount === 'number'));
   check('the owner is flattened to a name', listed[0].owner === 'Ada Lovelace', String(listed[0].owner));
+  check('a short list is not reported as truncated', listing.truncated === false);
 
   // 260 across six pages of 50, the last one short - the page loop is the part
   // most likely to either stop early or never stop at all.
   datasetCount = 260;
   seenRequests = [];
-  const paged = await service.fetchDatasets(adminA, connectionId);
+  const paged = (await service.fetchDatasets(adminA, connectionId, { limit: 260 })).datasets;
   check('paging reads every dataset', paged.length === 260, String(paged.length));
   const listCalls = seenRequests.filter((r) => r.path === '/api/data/v3/datasources');
   check('it took six pages of 50', listCalls.length === 6, String(listCalls.length));
@@ -311,7 +346,81 @@ async function cleanup() {
   void first;
 
   datasetCount = 0;
-  check('a token with no datasets is not an error', (await service.fetchDatasets(adminA, connectionId)).length === 0);
+  check(
+    'a token with no datasets is not an error',
+    (await service.fetchDatasets(adminA, connectionId)).datasets.length === 0
+  );
+
+  /* ---------------------------------------------------------------- */
+  section('The listing limit');
+
+  // Listing is the slowest thing the connector does, so it stops early by
+  // default. These check that it stops at the right place AND that it says so
+  // - a capped list that claims to be the whole warehouse is the failure that
+  // matters, because every later step is built from what was selected here.
+  datasetCount = 260;
+
+  seenRequests = [];
+  const capped = await service.fetchDatasets(adminA, connectionId);
+  check('the default stops at 20', capped.datasets.length === 20, String(capped.datasets.length));
+  check('the applied limit is reported', capped.limit === 20, String(capped.limit));
+  check('it says there is more', capped.truncated === true);
+  check(
+    'one page was enough',
+    seenRequests.filter((r) => r.path === '/api/data/v3/datasources').length === 1
+  );
+
+  seenRequests = [];
+  const ten = await service.fetchDatasets(adminA, connectionId, { limit: 10 });
+  check('an explicit limit is honoured', ten.datasets.length === 10, String(ten.datasets.length));
+  check(
+    'it asks for one row beyond the limit, to detect more',
+    new URLSearchParams(
+      seenRequests.find((r) => r.path === '/api/data/v3/datasources').query
+    ).get('limit') === '11'
+  );
+  check('the probe row is not returned', ten.datasets.length === 10);
+  check('ten of 260 is truncated', ten.truncated === true);
+
+  // The boundary the probe row exists for: asking for exactly what is there
+  // must not report more behind it.
+  datasetCount = 10;
+  const exact = await service.fetchDatasets(adminA, connectionId, { limit: 10 });
+  check('exactly-the-limit is not truncated', exact.truncated === false, String(exact.truncated));
+  check('and still returns them all', exact.datasets.length === 10, String(exact.datasets.length));
+
+  datasetCount = 5;
+  const under = await service.fetchDatasets(adminA, connectionId, { limit: 50 });
+  check('a limit above the total returns the total', under.datasets.length === 5, String(under.datasets.length));
+  check('and is not truncated', under.truncated === false);
+
+  /*
+   * The boundary that was wrong first time round.
+   *
+   * When the limit is a multiple of Domo's 50-row page cap, asking for
+   * "one more than is left" gets clipped back to 50 - so the probe row is
+   * never fetched, and a warehouse with hundreds of datasets reported that
+   * the first hundred were all of them. Reading the limit as a ceiling on the
+   * whole loop rather than a per-request increment is what fixes it, and
+   * these are the cases that tell the two apart.
+   */
+  datasetCount = 137;
+  const overPage = await service.fetchDatasets(adminA, connectionId, { limit: 100 });
+  check('a limit on a page boundary still detects more',
+    overPage.truncated === true, String(overPage.truncated));
+  check('and returns exactly the limit',
+    overPage.datasets.length === 100, String(overPage.datasets.length));
+
+  datasetCount = 100;
+  const onPage = await service.fetchDatasets(adminA, connectionId, { limit: 100 });
+  check('exactly a page-boundary total is not truncated',
+    onPage.truncated === false, String(onPage.truncated));
+
+  datasetCount = 51;
+  const justOver = await service.fetchDatasets(adminA, connectionId, { limit: 50 });
+  check('one beyond a single page is truncated',
+    justOver.truncated === true, String(justOver.truncated));
+
   datasetCount = 3;
 
   /* ------------------------------------------------------------------ */
@@ -326,7 +435,7 @@ async function cleanup() {
     ['{ searchResultsMap: { DATASET } }', (rows) => ({ searchResultsMap: { DATASET: rows } })],
   ]) {
     responseShape = wrap;
-    const got = await service.fetchDatasets(adminA, connectionId);
+    const got = (await service.fetchDatasets(adminA, connectionId)).datasets;
     check(`${label} is read correctly`, got.length === 3, String(got.length));
   }
 
@@ -343,7 +452,7 @@ async function cleanup() {
 
   responseShape = () => ({ dataSources: [] });
   check('a genuinely empty list is still not an error',
-    (await service.fetchDatasets(adminA, connectionId)).length === 0);
+    (await service.fetchDatasets(adminA, connectionId)).datasets.length === 0);
 
   responseShape = (rows) => rows;
 
@@ -379,6 +488,77 @@ async function cleanup() {
   await service.replaceSelection(adminA, connectionId, [{ id: 'ds-0000' }, { id: 'ds-0001' }]);
   const listRow = (await service.listConnections(adminA))[0];
   check('the list read carries the selected count', listRow.selectedDatasetCount === 2, String(listRow.selectedDatasetCount));
+
+  /* ------------------------------------------------------------------ */
+  section('Profiling');
+
+  /*
+   * Profile is SOURCE data, not AI output - that distinction is the reason it
+   * is a separate step from Understand, so these check that it reads the
+   * warehouse and reports what it found, including what it could not find.
+   */
+  // Re-selected WITH counts: the tree reports what was captured at selection
+  // time, so a selection that carried none is a tree of nulls.
+  await service.replaceSelection(adminA, connectionId, [
+    { id: 'ds-0000', name: 'Dataset 0000', rowCount: 1000, columnCount: 5 },
+    { id: 'ds-0001', name: 'Dataset 0001', rowCount: 1001, columnCount: 5 },
+  ]);
+
+  seenRequests = [];
+  const overview = await service.profileOverview(adminA, connectionId);
+  check('the tree is the stored selection', overview.datasets.length === 2, String(overview.datasets.length));
+  check('a Domo dataset is one table', overview.datasets[0].tables.length === 1);
+  check('the stored counts come through', overview.datasets[0].tables[0].rowCount === 1000,
+    String(overview.datasets[0].tables[0].rowCount));
+  check('the tree costs no warehouse call', seenRequests.length === 0, String(seenRequests.length));
+
+  await service.replaceSelection(adminA, connectionId, [{ id: 'ds-0000' }]);
+  const noCounts = await service.profileOverview(adminA, connectionId);
+  check('a selection with no counts reports null, not zero',
+    noCounts.datasets[0].tables[0].rowCount === null,
+    String(noCounts.datasets[0].tables[0].rowCount));
+  await service.replaceSelection(adminA, connectionId, [
+    { id: 'ds-0000', name: 'Dataset 0000', rowCount: 1000, columnCount: 5 },
+    { id: 'ds-0001', name: 'Dataset 0001', rowCount: 1001, columnCount: 5 },
+  ]);
+
+  seenRequests = [];
+  const profile = await service.tableProfile(adminA, connectionId, 'ds-0000');
+  check('the table name comes from the source', profile.name === 'Dataset ds-0000', profile.name);
+  check('the row count comes from the source', profile.rowCount === 4200, String(profile.rowCount));
+  check('storage is the byte count the source reported',
+    profile.sizeBytes === 2576980377, String(profile.sizeBytes));
+  check('the columns are the ones the source reports',
+    profile.columns.map((c) => c.name).join() === 'id,region,revenue',
+    profile.columns.map((c) => c.name).join());
+  check('column types come through', profile.columns[1].dataType === 'STRING', profile.columns[1].dataType);
+
+  // 1 of 4 region values is null; 3 of 4 revenue values are present.
+  check('null rates are computed from the sample',
+    profile.columns[1].nullPercent === 25, String(profile.columns[1].nullPercent));
+  check('distinct counts too',
+    profile.columns[1].uniqueCount === 2, String(profile.columns[1].uniqueCount));
+  check('min/max only for numeric columns',
+    profile.columns[2].min === 10.5 && profile.columns[2].max === 30.5,
+    `${profile.columns[2].min}/${profile.columns[2].max}`);
+  check('a text column gets no min/max',
+    profile.columns[1].min === null && profile.columns[1].max === null);
+  check('the stats say what they were computed over',
+    profile.statsSampleSize === 4, String(profile.statsSampleSize));
+  check('sample rows come back', profile.sample.rows.length === 4, String(profile.sample.rows.length));
+
+  // Nothing on this API surface reports these. Absent, not invented.
+  check('semantic types are absent rather than guessed', profile.columns[0].semanticType === null);
+  check('quality is absent rather than scored', profile.qualityScore === null);
+
+  check('it took one detail call and one query',
+    seenRequests.length === 2, String(seenRequests.length));
+
+  const unselected = await codeOf(() => service.tableProfile(adminA, connectionId, 'ds-0099'));
+  check('a table outside the selection is a 404', unselected === 'RESOURCE_NOT_FOUND', unselected);
+
+  const crossProfile = await codeOf(() => service.tableProfile(adminB, connectionId, 'ds-0000'));
+  check('another company cannot profile it', crossProfile === 'RESOURCE_NOT_FOUND', crossProfile);
 
   /* ------------------------------------------------------------------ */
   section('A credential that stops working');

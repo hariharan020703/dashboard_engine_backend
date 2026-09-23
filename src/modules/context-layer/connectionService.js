@@ -130,6 +130,106 @@ async function requireConnection(actor, id) {
   return shapeConnection(row, await selectedDatasets(row.id));
 }
 
+/* --------------------------------------------------------------- profile --- */
+
+/**
+ * The Profile step's navigation tree.
+ *
+ * Read from THIS database, not from the warehouse. The counts were captured
+ * when somebody chose the datasets, so the tree draws instantly and a
+ * warehouse that is briefly unreachable does not empty the screen. Anything
+ * that has to be current - the column list, the statistics, the sample - is
+ * fetched per table, live, when a table is actually opened.
+ *
+ * In Domo a dataset IS a table: there is no schema layer beneath it, so each
+ * selected dataset contributes exactly one table. A provider that genuinely
+ * nests tables under a schema would return several here, and nothing in the
+ * shape or in the UI has to change for it.
+ */
+async function profileOverview(actor, id) {
+  const row = await loadRow(actor, id);
+  const selected = await selectedDatasets(row.id);
+
+  return {
+    datasets: selected.map((dataset) => ({
+      datasetId: dataset.id,
+      name: dataset.name || dataset.id,
+      tableCount: 1,
+      tables: [
+        {
+          id: dataset.id,
+          datasetId: dataset.id,
+          name: dataset.name || dataset.id,
+          rowCount: dataset.rowCount,
+          columnCount: dataset.columnCount,
+        },
+      ],
+    })),
+    // When the selection was made. The per-table reads below are live.
+    profiledAt: selected.reduce(
+      (latest, d) => (!latest || d.selectedAt > latest ? d.selectedAt : latest),
+      null
+    ),
+  };
+}
+
+/**
+ * One table's full profile, read live from the warehouse.
+ *
+ * Restricted to the connection's own selection rather than accepting any id
+ * the warehouse would answer for. The connection is already company-scoped, so
+ * this is not the tenant boundary - it is the narrower statement that this
+ * endpoint profiles the datasets somebody chose, and nothing else. An id
+ * outside that set is a 404, the same as a dataset that does not exist.
+ */
+async function tableProfile(actor, id, tableId) {
+  const row = await loadRow(actor, id);
+  const impl = providerFor(row.provider);
+
+  if (typeof impl.getTableProfile !== 'function') {
+    throw fail(
+      'VALIDATION_ERROR',
+      `The ${row.provider} connector cannot profile tables yet.`
+    );
+  }
+
+  const selected = await selectedDatasets(row.id);
+  if (!selected.some((dataset) => dataset.id === String(tableId))) {
+    throw fail(
+      'RESOURCE_NOT_FOUND',
+      'That table is not part of this connection\'s selected datasets.'
+    );
+  }
+
+  let token;
+  try {
+    token = open(row.secret);
+  } catch {
+    await markStatus(row.id, 'invalid', 'The stored credential could not be decrypted.');
+    throw fail(
+      'CONNECTOR_AUTH_FAILED',
+      'The stored token for this connection could not be read. It has to be entered again.'
+    );
+  }
+
+  try {
+    const profile = await impl.getTableProfile({
+      host: row.host,
+      token,
+      datasetId: String(tableId),
+    });
+    await markStatus(row.id, 'connected', null);
+    return profile;
+  } catch (err) {
+    // Same rule as listing: only a refused credential marks the connection
+    // broken. A momentarily unreachable instance is not a bad token.
+    if (err.code === 'CONNECTOR_AUTH_FAILED') {
+      await markStatus(row.id, 'invalid', err.message);
+    }
+    throw err;
+  }
+}
+
 /* ----------------------------------------------------------------- writes --- */
 
 /**
@@ -140,7 +240,7 @@ async function requireConnection(actor, id) {
  * relied on is the moment somebody is waiting for a context that will never
  * build. If the token is refused, nothing is written.
  */
-async function createConnection(actor, companyId, { provider, name, host, token }) {
+async function createConnection(actor, companyId, { provider, name, host, token, limit }) {
   const impl = providerFor(provider);
   const providerId = String(provider).trim().toLowerCase();
 
@@ -152,7 +252,13 @@ async function createConnection(actor, companyId, { provider, name, host, token 
   }
 
   const account = await impl.verify({ host: cleanHost, token: cleanToken });
-  const datasets = await impl.listDatasets({ host: cleanHost, token: cleanToken });
+  /*
+   * Listed here as well as by the picker, because proving the credential can
+   * actually read data is the point - and the picker then has its first page
+   * without a second round trip to the warehouse. Same limit as any other
+   * listing: this is a seed, not an inventory.
+   */
+  const listing = await impl.listDatasets({ host: cleanHost, token: cleanToken, limit });
 
   const id = crypto.randomUUID();
   try {
@@ -170,7 +276,13 @@ async function createConnection(actor, companyId, { provider, name, host, token 
   }
 
   const row = await loadRow(actor, id);
-  return { connection: shapeConnection(row, []), account, datasets };
+  return {
+    connection: shapeConnection(row, []),
+    account,
+    datasets: listing.datasets,
+    truncated: listing.truncated,
+    limit: listing.limit,
+  };
 }
 
 /**
@@ -184,7 +296,7 @@ async function createConnection(actor, companyId, { provider, name, host, token 
  * that has since been revoked is visibly broken on the list rather than only
  * when somebody opens it.
  */
-async function fetchDatasets(actor, id) {
+async function fetchDatasets(actor, id, { limit } = {}) {
   const row = await loadRow(actor, id);
   const impl = providerFor(row.provider);
 
@@ -200,9 +312,9 @@ async function fetchDatasets(actor, id) {
   }
 
   try {
-    const datasets = await impl.listDatasets({ host: row.host, token });
+    const listing = await impl.listDatasets({ host: row.host, token, limit });
     await markStatus(row.id, 'connected', null);
-    return datasets;
+    return listing;
   } catch (err) {
     // Only a refused credential marks the connection broken. An instance that
     // is briefly unreachable is not a reason to tell somebody their token is
@@ -311,6 +423,8 @@ module.exports = {
   requireConnection,
   createConnection,
   fetchDatasets,
+  profileOverview,
+  tableProfile,
   verifyConnection,
   replaceSelection,
   deleteConnection,
