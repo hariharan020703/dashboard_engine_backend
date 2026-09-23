@@ -11,6 +11,8 @@ const {
 } = require('../../middleware/auth');
 const { CONNECTORS, findConnector, STATUS } = require('./connectorCatalogue');
 const connections = require('./connectionService');
+const contextStore = require('./contextStore');
+const publish = require('./publishService');
 
 /**
  * The context layer: warehouse connections, and the datasets chosen from them.
@@ -180,6 +182,144 @@ router.get(
     ok(res, await connections.tableProfile(req.actor, req.params.id, req.params.tableId));
   }
 );
+
+/* ------------------------------------------------- steps 5, 6 and 7 --- */
+
+/*
+ * Everything below reads `context_objects`, which the Context Layer service
+ * writes and this application only reads (plus the three review columns that
+ * exist for exactly that). It works because the two now share one database.
+ *
+ * Tenant isolation comes from `requireConnection`, which is company-scoped in
+ * SQL: `workspace_id` on those rows IS a connection id, so proving the caller
+ * may see the connection proves they may see its facts.
+ */
+async function connectionFor(req) {
+  return connections.requireConnection(req.actor, req.params.id);
+}
+
+// GET /api/context/connections/:id/model - the relationship graph.
+router.get('/connections/:id/model', requirePermission('context.read'), async (req, res) => {
+  const connection = await connectionFor(req);
+  ok(res, await contextStore.modelGraph(connection.id));
+});
+
+// GET /api/context/connections/:id/review - the review queue.
+router.get('/connections/:id/review', requirePermission('context.read'), async (req, res) => {
+  const connection = await connectionFor(req);
+  ok(res, await contextStore.reviewQueue(connection.id, req.query));
+});
+
+/*
+ * POST .../review/:itemId/decision - approve, reject or skip.
+ *
+ * `update` in the body is applied first, in the same request, so "edit and
+ * approve" cannot land as an edit that saved and an approval that did not.
+ */
+router.post(
+  '/connections/:id/review/:itemId/decision',
+  requirePermission('context.manage'),
+  async (req, res) => {
+    const connection = await connectionFor(req);
+    const { decision, update } = req.body || {};
+
+    if (update) {
+      await contextStore.updateReviewItem(req.actor, connection.id, req.params.itemId, update);
+    }
+    const item = await contextStore.decideReviewItem(
+      req.actor,
+      connection.id,
+      req.params.itemId,
+      decision
+    );
+
+    audit(EVENTS.CONTEXT_REVIEW_DECIDED, req.actor, {
+      connectionId: connection.id,
+      objectId: req.params.itemId,
+      decision,
+      edited: Boolean(update),
+    });
+    ok(res, item);
+  }
+);
+
+// PATCH .../review/:itemId - edit without deciding.
+router.patch(
+  '/connections/:id/review/:itemId',
+  requirePermission('context.manage'),
+  async (req, res) => {
+    const connection = await connectionFor(req);
+    ok(
+      res,
+      await contextStore.updateReviewItem(req.actor, connection.id, req.params.itemId, req.body || {})
+    );
+  }
+);
+
+// POST .../review/decision - one decision across everything matching a filter.
+router.post(
+  '/connections/:id/review/decision',
+  requirePermission('context.manage'),
+  async (req, res) => {
+    const connection = await connectionFor(req);
+    const result = await contextStore.bulkDecide(req.actor, connection.id, req.body || {});
+
+    audit(EVENTS.CONTEXT_REVIEW_DECIDED, req.actor, {
+      connectionId: connection.id,
+      decision: (req.body || {}).decision,
+      bulk: true,
+      affected: result.affected,
+    });
+    ok(res, result);
+  }
+);
+
+// GET .../publish/summary - what publishing would include, counted server-side.
+router.get(
+  '/connections/:id/publish/summary',
+  requirePermission('context.read'),
+  async (req, res) => {
+    const connection = await connectionFor(req);
+    ok(res, await publish.publishSummary(req.actor, connection));
+  }
+);
+
+// POST .../publish/validate - the pre-flight, without publishing.
+router.post(
+  '/connections/:id/publish/validate',
+  requirePermission('context.read'),
+  async (req, res) => {
+    const connection = await connectionFor(req);
+    ok(res, await publish.validatePublish(req.actor, connection));
+  }
+);
+
+// GET .../publish - every version published under this connection.
+router.get('/connections/:id/publish', requirePermission('context.read'), async (req, res) => {
+  const connection = await connectionFor(req);
+  ok(res, await publish.listPublications(connection.id));
+});
+
+/*
+ * POST .../publish - write the snapshot.
+ *
+ * `name` is required and is the point of the step: a connection is where the
+ * data came from, a published context is what it is FOR, and one connection
+ * can produce several.
+ */
+router.post('/connections/:id/publish', requirePermission('context.manage'), async (req, res) => {
+  const connection = await connectionFor(req);
+  const result = await publish.publishContext(req.actor, connection, req.body || {});
+
+  audit(EVENTS.CONTEXT_PUBLISHED, req.actor, {
+    connectionId: connection.id,
+    publicationId: result.id,
+    name: result.name,
+    version: result.version,
+    objectCount: result.objectCount,
+  });
+  ok(res, result, 201);
+});
 
 /*
  * PUT /api/context/connections/:id/datasets - record the chosen datasets.

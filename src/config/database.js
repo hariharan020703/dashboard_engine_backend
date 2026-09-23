@@ -1,6 +1,6 @@
 require('./env');
 const { createPool, quoteIdentifier } = require('./pgPool');
-const { required, optional, integer } = require('./configError');
+const { required, optional, integer, boolean } = require('./configError');
 
 /**
  * The application's one PostgreSQL connection pool.
@@ -21,6 +21,26 @@ const { required, optional, integer } = require('./configError');
  * second pool and point the `T` names at it.
  */
 
+/**
+ * TLS to the database.
+ *
+ * Off by default, because the original deployment was a PostgreSQL on the same
+ * host and encrypting a loopback connection buys nothing. It is required the
+ * moment the database is somewhere else - a managed provider refuses a plain
+ * connection outright, and the failure presents as a timeout rather than as
+ * anything mentioning TLS.
+ *
+ * `DB_SSL_REJECT_UNAUTHORIZED=false` is the escape hatch for a provider that
+ * presents a certificate signed by its own authority, which several managed
+ * hosts do. It weakens the connection to encryption-without-authentication, so
+ * it is a separate, explicit setting rather than something `DB_SSL=true`
+ * quietly implies.
+ */
+function sslConfig() {
+  if (!boolean('DB_SSL', false)) return false;
+  return { rejectUnauthorized: boolean('DB_SSL_REJECT_UNAUTHORIZED', true) };
+}
+
 const pool = createPool({
   host: required('DB_HOST', 'the PostgreSQL server this application uses'),
   port: integer('DB_PORT', 5432, { min: 1, max: 65535 }),
@@ -28,9 +48,15 @@ const pool = createPool({
   password: optional('DB_PASSWORD', ''),
   database: required('DB_NAME', 'the database holding both the reporting tables and app metadata'),
   max: integer('DB_POOL_SIZE', 10, { min: 1, max: 100 }),
-  // A dashboard request fans out into several queries; waiting forever on a
-  // pool that cannot connect turns a misconfiguration into a hung page.
-  connectionTimeoutMillis: integer('DB_CONNECT_TIMEOUT_MS', 10000, { min: 1000 }),
+  ssl: sslConfig(),
+  /*
+   * A dashboard request fans out into several queries; waiting forever on a
+   * pool that cannot connect turns a misconfiguration into a hung page.
+   *
+   * The default is generous enough for a database across the internet, where
+   * the TLS handshake alone can outlast a loopback-sized timeout.
+   */
+  connectionTimeoutMillis: integer('DB_CONNECT_TIMEOUT_MS', 15000, { min: 1000 }),
   idleTimeoutMillis: 30000,
 });
 

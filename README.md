@@ -491,9 +491,49 @@ The engine targets PostgreSQL only. The differences that shaped the code:
 npm start                 # serve the API and the built frontend
 npm run setup:indexes     # create indexes from dashboard metadata (--dry-run supported)
 npm run reset:access      # email an account a new activation link, without a token
+npm run migrate:db        # copy this database into the one .env points at
 npm run test:e2e          # the RBAC/tenancy/token suite (see tests/rbac.e2e.js)
 npm run test:context      # the context layer (see tests/contextLayer.test.js)
 ```
+
+### Moving the database
+
+`migrate:db` copies everything — accounts, grants, dashboards, connections and the
+reporting tables — into whatever `.env` currently points at. The destination's schema is
+created by `bootstrapAppMeta()`, the same code that runs at every start, so the script
+cannot drift from the real definition.
+
+```bash
+# 1. point .env at the new database (DB_HOST/DB_NAME/DB_USER/DB_PASSWORD, DB_SSL)
+# 2. rehearse
+SOURCE_DB_URL=postgresql://postgres:root@localhost:5432/elze npm run migrate:db -- --dry-run
+# 3. run it
+SOURCE_DB_URL=postgresql://postgres:root@localhost:5432/elze npm run migrate:db
+```
+
+Three things worth knowing:
+
+- **The source always wins.** Every insert upserts. `bootstrapAppMeta()` seeds the three
+  roles and — on an empty users table — the platform owner, and those rows collide with the
+  real ones. With `DO NOTHING` the seeded row would win and the owner would silently end up
+  with the bootstrap password from `config/appConfig.js`, discovered at the next sign-in.
+- **Re-running is safe**, and resumes: a run that failed halfway is fixed by running it again.
+- **`--skip-reporting`** copies only the application tables. The reporting tables are the
+  slow half (`cinema_analysis` is 200k rows) and are discovered rather than listed — whatever
+  is in the source and is not one of ours.
+
+Identity sequences are advanced past the copied ids at the end. Without that, the first
+account created after a migration reuses id 1 and fails on the primary key, days later,
+with nothing pointing back at the migration.
+
+### Connecting to a database elsewhere
+
+`DB_SSL=true` is required by every managed provider, and its absence presents as a
+**connection timeout** rather than as anything mentioning TLS. Where the provider signs its
+certificate with its own authority — Render, Heroku, and most others — add
+`DB_SSL_REJECT_UNAUTHORIZED=false`. That weakens the connection to
+encryption-without-authentication, which is why it is a second, explicit setting rather
+than something `DB_SSL=true` quietly implies.
 
 The suite brings its own SMTP relay and its own reporting table, so it needs a throwaway
 database and the server pointed at that relay. `DB_NAME` goes on **both** processes — the

@@ -67,6 +67,8 @@ const EVENTS = {
   CONTEXT_CONNECTION_CREATED: 'context_connection_created',
   CONTEXT_CONNECTION_DELETED: 'context_connection_deleted',
   CONTEXT_DATASETS_SELECTED: 'context_datasets_selected',
+  CONTEXT_REVIEW_DECIDED: 'context_review_decided',
+  CONTEXT_PUBLISHED: 'context_published',
 };
 
 const KNOWN_EVENTS = new Set(Object.values(EVENTS));

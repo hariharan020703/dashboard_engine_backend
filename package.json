@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "setup:indexes": "node scripts/setupIndexes.js",
     "reset:access": "node scripts/resetAccess.js",
+    "migrate:db": "node scripts/migrateDatabase.js",
     "test:e2e": "node tests/rbac.e2e.js",
     "test:context": "node tests/contextLayer.test.js"
   },

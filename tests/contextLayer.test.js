@@ -29,6 +29,8 @@ const { bootstrapAppMeta } = require('../src/auth/appMetaSchema');
 const { seal, open, hint } = require('../src/modules/context-layer/secretBox');
 const domo = require('../src/modules/context-layer/providers/domo');
 const service = require('../src/modules/context-layer/connectionService');
+const store = require('../src/modules/context-layer/contextStore');
+const publish = require('../src/modules/context-layer/publishService');
 
 let passed = 0;
 let failed = 0;
@@ -592,6 +594,187 @@ async function cleanup() {
   check('an outage is CONNECTOR_UNREACHABLE', blip === 'CONNECTOR_UNREACHABLE', blip);
 
   global.fetch = realFetch;
+  installFakeDomo();
+
+  /* ------------------------------------------------------------------ */
+  section('Model, review and publish');
+
+  /*
+   * These read `context_objects`, which the Context Layer service owns and
+   * this suite's database does not have. Created here rather than skipped,
+   * because the SQL against it - the latest-session subquery, the JSONB
+   * merge, the two-table transaction - is exactly the part worth proving.
+   */
+  await db.raw(`
+    CREATE TABLE IF NOT EXISTS context_objects (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      workspace_id UUID NOT NULL,
+      bundle_id UUID NULL,
+      object_type TEXT NOT NULL,
+      qualified_name TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      verified BOOLEAN NOT NULL DEFAULT false,
+      confidence NUMERIC,
+      payload JSONB NOT NULL,
+      reviewed_by TEXT,
+      reviewed_at TIMESTAMPTZ,
+      session_id TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (workspace_id, qualified_name)
+    )`);
+
+  const fixture = async (ws, session, type, name, payload, extra = {}) => {
+    const { rows } = await db.query(
+      `INSERT INTO context_objects
+         (workspace_id, object_type, qualified_name, source_type, verified,
+          confidence, payload, session_id, created_at)
+       VALUES (?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?, now() + (? * interval '1 second'))
+       RETURNING id`,
+      [ws, type, name, extra.source || 'db_inferred', extra.verified ?? false,
+       extra.confidence ?? null, JSON.stringify(payload), session, extra.order ?? 0]
+    );
+    return rows[0].id;
+  };
+
+  const ws = connectionId;
+  const RUN = 'run-current';
+
+  // An older run, to prove only the latest one is read.
+  await fixture(ws, 'run-old', 'table', 'stale_table', { description: 'from a previous run' }, { order: -100 });
+
+  await fixture(ws, RUN, 'table', 'orders', { description: 'Order header rows' }, { order: 1 });
+  await fixture(ws, RUN, 'table', 'customers', { description: 'Customer master' }, { order: 2 });
+  const colId = await fixture(ws, RUN, 'column_stats', 'orders.customer_id',
+    { data_type: 'STRING', null_rate: '0.0%', description: 'FK to customers', note: 'candidate primary key' },
+    { order: 3 });
+  await fixture(ws, RUN, 'column_stats', 'orders.total',
+    { data_type: 'DOUBLE', null_rate: '0.0%', description: 'Order total' }, { order: 4 });
+  await fixture(ws, RUN, 'join', 'orders__customers', {
+    tables: ['orders', 'customers'],
+    join_keys: [{ left: 'customer_id', right: 'id' }],
+    cardinality: 'many:1',
+    basis: 'FK enforced',
+  }, { confidence: 0.97, order: 5 });
+  // A join naming a table with no `table` row - the node must still appear.
+  await fixture(ws, RUN, 'join', 'orders__regions', {
+    tables: ['orders', 'regions'],
+    join_keys: [{ left: 'region_code', right: 'code' }],
+    cardinality: 'many:1',
+    basis: 'name match',
+  }, { confidence: 0.6, order: 6 });
+
+  const graph = await store.modelGraph(ws);
+  check('only the latest run is read',
+    !graph.nodes.some((n) => n.id === 'stale_table'),
+    graph.nodes.map((n) => n.id).join(','));
+  check('a node per table', graph.nodes.length === 3, String(graph.nodes.length));
+  check('a join to an unrecorded table still makes a node',
+    graph.nodes.some((n) => n.id === 'regions'));
+  check('columns hang off their table',
+    graph.nodes.find((n) => n.id === 'orders').columns.length === 2,
+    String(graph.nodes.find((n) => n.id === 'orders').columns.length));
+  check('a candidate key is read from the note, not guessed',
+    graph.nodes.find((n) => n.id === 'orders').columns.find((c) => c.name === 'customer_id').isPrimaryKey);
+  check('an edge per join', graph.edges.length === 2, String(graph.edges.length));
+  check('the join condition is built from join_keys',
+    graph.edges[0].joinCondition === 'orders.customer_id = customers.id',
+    graph.edges[0].joinCondition);
+  check('confidence comes through', graph.edges[0].confidence === 0.97, String(graph.edges[0].confidence));
+  check('an unverified join is suggested', graph.edges[0].status === 'suggested', graph.edges[0].status);
+
+  const queue = await store.reviewQueue(ws);
+  check('every object is reviewable', queue.total === 6, String(queue.total));
+  check('counts are per type', queue.counts.column_stats === 2 && queue.counts.join === 2,
+    JSON.stringify(queue.counts));
+  check('everything starts pending',
+    queue.items.every((i) => i.status === 'pending'));
+  check('the note surfaces as downstream impact',
+    queue.items.find((i) => i.id === colId).downstreamImpact === 'candidate primary key');
+
+  await store.decideReviewItem(adminA, ws, colId, 'approve');
+  const afterApprove = await store.reviewQueue(ws);
+  check('approving sets our status',
+    afterApprove.items.find((i) => i.id === colId).status === 'approved');
+  const { rows: verifiedRow } = await db.query(
+    'SELECT verified, reviewed_by FROM context_objects WHERE id = ?::uuid', [colId]);
+  check('and mirrors verified into context_objects, which the analyst agent reads',
+    verifiedRow[0].verified === true, String(verifiedRow[0].verified));
+  check('recording who did it', verifiedRow[0].reviewed_by === adminA.username);
+
+  await store.decideReviewItem(adminA, ws, colId, 'skip');
+  const { rows: afterSkip } = await db.query(
+    'SELECT verified FROM context_objects WHERE id = ?::uuid', [colId]);
+  check('skip records a status but does not touch verified',
+    afterSkip[0].verified === true, String(afterSkip[0].verified));
+  check('skip is a status a boolean cannot hold',
+    (await store.reviewQueue(ws)).items.find((i) => i.id === colId).status === 'skipped');
+
+  await store.updateReviewItem(adminA, ws, colId, { description: 'Edited by a human' });
+  const { rows: merged } = await db.query(
+    'SELECT payload FROM context_objects WHERE id = ?::uuid', [colId]);
+  check('an edit changes the key it names',
+    merged[0].payload.description === 'Edited by a human', merged[0].payload.description);
+  check('and merges rather than replacing - the rest of the payload survives',
+    merged[0].payload.data_type === 'STRING' && merged[0].payload.null_rate === '0.0%',
+    JSON.stringify(merged[0].payload));
+
+  const bulk = await store.bulkDecide(adminA, ws, {
+    decision: 'approve', filter: { minConfidence: 0.9 },
+  });
+  check('a bulk decision acts on what matches, not on what is on screen',
+    bulk.affected === 1, String(bulk.affected));
+  check('a row with no confidence does not pass a confidence bar',
+    (await store.reviewQueue(ws)).items.find((i) => i.type === 'table').status === 'pending');
+
+  const crossReview = await codeOf(() => service.requireConnection(adminB, connectionId));
+  check('another company cannot reach this connection at all',
+    crossReview === 'RESOURCE_NOT_FOUND', crossReview);
+
+  // The column above is currently skipped. Approving it again proves a skip is
+  // "not now" rather than a terminal state, and gives the publish below two
+  // approved facts of different types to count.
+  await store.decideReviewItem(adminA, ws, colId, 'approve');
+  check('a skipped item can be approved later',
+    (await store.reviewQueue(ws)).items.find((i) => i.id === colId).status === 'approved');
+
+  /* ------------------------------------------------------------------ */
+  const connectionRow = await service.requireConnection(adminA, connectionId);
+
+  let summary = await publish.publishSummary(adminA, connectionRow);
+  check('the summary counts approved facts only',
+    summary.stats.find((s) => s.id === 'columns').value === 1,
+    JSON.stringify(summary.stats.find((s) => s.id === 'columns')));
+  check('pending items are a warning, not a blocker',
+    summary.blockers.some((b) => b.severity === 'warning' && b.step === 'review'));
+  check('it is publishable once something is approved', summary.ready === true);
+  check('the name defaults to the connection, as a starting point',
+    summary.suggestedName === connectionRow.name, summary.suggestedName);
+
+  const noName = await codeOf(() => publish.publishContext(adminA, connectionRow, { name: '' }));
+  check('publishing requires a name', noName === 'VALIDATION_ERROR', noName);
+
+  const v1 = await publish.publishContext(adminA, connectionRow, { name: 'Revenue' });
+  check('publishing returns a version', v1.version === 'v1', v1.version);
+  check('and counts what it stored', v1.objectCount === 2, String(v1.objectCount));
+
+  const { rows: storedRow } = await db.query(
+    `SELECT name, version, object_count, snapshot, company_id
+       FROM ${CT.publications} WHERE id = ?::uuid`, [v1.id]);
+  check('the row is keyed by the name the user gave',
+    storedRow[0].name === 'Revenue', storedRow[0].name);
+  check('and scoped to their company', storedRow[0].company_id === companyA);
+  check('the snapshot holds the facts themselves, not just ids',
+    Array.isArray(storedRow[0].snapshot) && storedRow[0].snapshot[0].payload !== undefined,
+    JSON.stringify(storedRow[0].snapshot).slice(0, 80));
+
+  const v2 = await publish.publishContext(adminA, connectionRow, { name: 'Revenue' });
+  check('republishing the same name makes the next version', v2.version === 'v2', v2.version);
+  const other = await publish.publishContext(adminA, connectionRow, { name: 'Site safety' });
+  check('a different name starts again at v1', other.version === 'v1', other.version);
+
+  const history = await publish.listPublications(connectionId);
+  check('every version is listed, newest first', history.length === 3, String(history.length));
 
   /* ------------------------------------------------------------------ */
   section('Deleting');

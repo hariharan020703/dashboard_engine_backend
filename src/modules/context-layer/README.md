@@ -13,6 +13,33 @@ schema.js               this module's two tables
 providers/domo.js       the only implemented provider
 ```
 
+## These two tables are shared
+
+`connections` and `datasets` are **not ours alone**. The Context Layer service
+(`Elze-backend/`) reads the same rows, in the same database:
+
+| Reader | Query |
+|---|---|
+| `mcp-domo/credentials_client.py` | `SELECT provider, host, secret FROM connections WHERE id = %s` |
+| `adk_agents/api/db.py` | `SELECT 1 FROM connections WHERE id = %s` — its workspace check |
+| `mcp-domo`'s `list_selected_datasets` | reads `datasets` for what a user picked |
+
+That service has no `workspaces` table: **a connection's id doubles as its
+`workspace_id`**. So a connection written here is what makes an agent session
+possible there, and the two halves only meet if they are in one database under
+one spelling.
+
+They used to be `context_connections` / `context_connection_datasets` in a
+database of our own, which is why agent sessions failed with "workspace not
+found" — the row existed, in the wrong place, under the wrong name. Renaming
+here rather than adding a view keeps one set of rows with one spelling: a view
+would satisfy the reads, but the writes below would still be landing somewhere
+the other service never looks.
+
+**Consequence for this module:** the column set is now a shared contract. Adding
+a column is safe; renaming or dropping one breaks a service in another
+repository, and nothing in this build will catch it.
+
 ## Where it touches the rest of the application
 
 Six lines, on purpose — the point of the folder is that sharing or merging this
