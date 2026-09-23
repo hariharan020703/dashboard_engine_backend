@@ -40,7 +40,7 @@ router.get(
   requirePermission('data.read'),
   requireDashboardAccess('view'),
   async (req, res) => {
-    const spec = getSpec(req.dashboardId);
+    const spec = await getSpec(req.dashboardId);
     const meta = await resolveSourceMetadata(spec);
     // Schema-qualified: the pool's search_path is not something a dashboard's
     // row count should depend on.
@@ -86,13 +86,13 @@ router.get(
 router.post(
   '/preview',
   requirePermission('dashboard.update'),
-  requireDashboardAccess('developer'),
+  requireDashboardAccess('view'),
   async (req, res) => {
     const { card, filters } = req.body || {};
     if (!card || typeof card !== 'object') throw fail('VALIDATION_ERROR', 'Expected { card }');
 
     const draft = flattenCard(card);
-    const spec = getSpec(req.dashboardId);
+    const spec = await getSpec(req.dashboardId);
     // Slicers stay in the spec so filter ids still resolve to columns; their
     // queries are already cached from the dashboard request.
     const draftSpec = { ...spec, cards: [draft] };

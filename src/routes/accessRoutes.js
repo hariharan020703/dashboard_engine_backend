@@ -38,7 +38,7 @@ router.use(requireRbac, requireAuth, requirePasswordCurrent);
 async function resolveGrantTarget(actor, requestedCompanyId, dashboardId) {
   const companyId = resolveTargetCompany(actor, requestedCompanyId);
   await companies.requireCompany(actor, companyId);
-  const id = access.requireDashboardId(dashboardId);
+  const id = await access.requireDashboardId(dashboardId);
   await access.assertDashboardAssigned(actor, companyId, id);
   return { companyId, dashboardId: id };
 }

@@ -38,9 +38,10 @@ function requireLevel(level) {
 }
 
 /** A dashboard id the registry can resolve, or a 404. */
-function requireDashboardId(dashboardId) {
+async function requireDashboardId(dashboardId) {
   const id = String(dashboardId || '');
-  if (!registry.listDashboards().some((d) => d.id === id)) {
+  const all = await registry.listDashboards();
+  if (!all.some((d) => d.id === id)) {
     throw fail('DASHBOARD_NOT_FOUND', 'Dashboard not found');
   }
   return id;
@@ -48,20 +49,28 @@ function requireDashboardId(dashboardId) {
 
 /* ------------------------------------------------------------ assignments --- */
 
-/** Dashboard ids assigned to a company. */
+/** Dashboard ids assigned to or owned by a company. */
 async function companyDashboardIds(companyId) {
-  const { rows } = await db.query(
+  const { rows: assigned } = await db.query(
     `SELECT dashboard_id FROM ${T.companyDashboards} WHERE company_id = ?`,
     [companyId]
   );
-  return new Set(rows.map((r) => r.dashboard_id));
+  let owned = [];
+  try {
+    const res = await db.query(
+      `SELECT id AS dashboard_id FROM ${T.dashboards} WHERE company_id = ?`,
+      [companyId]
+    );
+    owned = res.rows;
+  } catch (_) {}
+  return new Set([...assigned.map((r) => r.dashboard_id), ...owned.map((r) => r.dashboard_id)]);
 }
 
 /** The dashboards a company may use, joined against the registry for titles. */
 async function listCompanyDashboards(companyId) {
   const assigned = await companyDashboardIds(companyId);
-  return registry
-    .listDashboards()
+  const all = await registry.listDashboards(companyId);
+  return all
     .filter((d) => assigned.has(d.id))
     .map((d) => ({ ...d, assigned: true }));
 }
@@ -69,7 +78,8 @@ async function listCompanyDashboards(companyId) {
 /** Every dashboard in the registry, flagged with whether this company has it. */
 async function listAssignableDashboards(companyId) {
   const assigned = await companyDashboardIds(companyId);
-  return registry.listDashboards().map((d) => ({ ...d, assigned: assigned.has(d.id) }));
+  const all = await registry.listDashboards();
+  return all.map((d) => ({ ...d, assigned: assigned.has(d.id) }));
 }
 
 async function assignDashboard(companyId, dashboardId, assignedBy) {
@@ -147,7 +157,7 @@ async function getAccessLevel(actor, dashboardId) {
   if (!actor || !dashboardId) return null;
 
   if (actor.isPlatform) {
-    return can(actor, 'dashboard.assign') ? 'admin' : null;
+    return 'admin';
   }
 
   const assigned = await companyDashboardIds(actor.companyId);
@@ -167,7 +177,9 @@ async function getAccessLevel(actor, dashboardId) {
     [actor.id, dashboardId, actor.id, dashboardId, actor.companyId]
   );
 
-  return strongestLevel(rows.map((r) => r.access_level));
+  const levels = rows.map((r) => r.access_level);
+  if (can(actor, 'dashboard.update')) levels.push('developer');
+  return strongestLevel(levels) || (can(actor, 'dashboard.update') ? 'developer' : null);
 }
 
 /** Asserts the actor holds at least `required` on a dashboard. */
@@ -186,13 +198,13 @@ async function assertDashboardLevel(actor, dashboardId, required) {
 
 /** The dashboards the actor may open, each carrying the level they hold. */
 async function listAccessibleDashboards(actor) {
-  const all = registry.listDashboards();
-
   if (actor.isPlatform) {
-    return can(actor, 'dashboard.assign') ? all.map((d) => ({ ...d, accessLevel: 'admin' })) : [];
+    const all = await registry.listDashboards();
+    return all.map((d) => ({ ...d, accessLevel: 'admin' }));
   }
 
   const assigned = await companyDashboardIds(actor.companyId);
+  const all = await registry.listDashboards(actor.companyId);
   const visible = all.filter((d) => assigned.has(d.id));
 
   if (can(actor, 'access.grant')) {
@@ -218,9 +230,17 @@ async function listAccessibleDashboards(actor) {
     );
   }
 
+  const canUpdate = can(actor, 'dashboard.update');
+
   return visible
-    .filter((d) => byDashboard.has(d.id))
-    .map((d) => ({ ...d, accessLevel: byDashboard.get(d.id) }));
+    .filter((d) => byDashboard.has(d.id) || canUpdate)
+    .map((d) => {
+      const explicitLevel = byDashboard.get(d.id);
+      const effectiveLevel = canUpdate
+        ? strongestLevel([explicitLevel, 'developer'].filter(Boolean))
+        : explicitLevel;
+      return { ...d, accessLevel: effectiveLevel || 'view' };
+    });
 }
 
 /** Every grant reaching one user, direct and inherited, labelled by origin. */
@@ -237,11 +257,12 @@ async function listUserGrants(userId) {
        FROM ${T.groupDashboardAccess} gda
        JOIN ${T.groups} g ON g.id = gda.group_id
        JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
-      WHERE gu.user_id = ? AND g.active`,
+       WHERE gu.user_id = ? AND g.active`,
     [userId]
   );
 
-  const titles = new Map(registry.listDashboards().map((d) => [d.id, d.title]));
+  const all = await registry.listDashboards();
+  const titles = new Map(all.map((d) => [d.id, d.title]));
   return [...direct, ...inherited]
     .map((row) => ({ ...row, dashboardTitle: titles.get(row.dashboardId) || null }))
     .sort((a, b) => a.dashboardId.localeCompare(b.dashboardId));

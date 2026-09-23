@@ -82,7 +82,7 @@ router.get('/overview', requirePermission('company.read'), async (req, res) => {
   ok(res, {
     ...numeric,
     companiesInactive: numeric.companies - numeric.companiesActive,
-    dashboards: registry.listDashboards().length,
+    dashboards: (await registry.listDashboards()).length,
   });
 });
 
@@ -97,7 +97,7 @@ router.get('/overview', requirePermission('company.read'), async (req, res) => {
  * Nothing secret is included: lifetimes, limits and which transport is
  * configured, never a secret, a host or a credential.
  */
-router.get('/settings', (req, res) => {
+router.get('/settings', async (req, res) => {
   ok(res, {
     tokens: {
       accessTokenTtlSeconds: ACCESS_TOKEN_TTL_SECONDS,
@@ -119,7 +119,7 @@ router.get('/settings', (req, res) => {
     },
     engine: {
       queryConcurrency: QUERY_CONCURRENCY,
-      dashboardCount: registry.listDashboards().length,
+      dashboardCount: (await registry.listDashboards()).length,
     },
     email: describeTransport(),
   });

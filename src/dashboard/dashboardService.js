@@ -2,8 +2,8 @@ const { hydrateDashboard } = require('../query/queryEngine');
 const registry = require('./dashboardRegistry');
 
 /** Resolves a dashboard spec by id, or the default dashboard when id is omitted. */
-function getSpec(dashboardId) {
-  return dashboardId == null ? registry.resolveDefaultSpec() : registry.resolveSpec(dashboardId);
+async function getSpec(dashboardId) {
+  return dashboardId == null ? await registry.resolveDefaultSpec() : await registry.resolveSpec(dashboardId);
 }
 
 function invalidateSpecCache(dashboardId) {
@@ -12,7 +12,7 @@ function invalidateSpecCache(dashboardId) {
 
 async function hydrateView(filters, spec) {
   const t0 = Date.now();
-  const resolvedSpec = spec || registry.resolveDefaultSpec();
+  const resolvedSpec = spec || (await registry.resolveDefaultSpec());
   const t1 = Date.now();
 
   const data = await hydrateDashboard(resolvedSpec, filters || {});

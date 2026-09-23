@@ -61,7 +61,9 @@ const ALL_PERMISSIONS = [
   { id: 'access.revoke', label: 'Revoke Access', description: 'Take dashboard access away from a user or group.' },
 
   { id: 'dashboard.read', label: 'Open Dashboards', description: 'Open a dashboard that has been granted to you.' },
+  { id: 'dashboard.create', label: 'Create Dashboards', description: 'Create new dashboards.' },
   { id: 'dashboard.update', label: 'Edit Dashboards', description: 'Change the card configuration of a dashboard.' },
+  { id: 'dashboard.delete', label: 'Delete Dashboards', description: 'Permanently remove a dashboard.' },
   { id: 'dashboard.assign', label: 'Assign Dashboards', description: 'Decide which dashboards a company may use.' },
 
   { id: 'data.read', label: 'Read Data', description: 'Read the source tables behind a granted dashboard.' },
@@ -124,11 +126,12 @@ const DEFAULT_ROLE_PERMISSIONS = {
     'role.read',
     'group.read', 'group.create', 'group.update', 'group.delete',
     'access.read', 'access.grant', 'access.revoke',
-    'dashboard.read', 'data.read',
+    'dashboard.read', 'dashboard.create', 'dashboard.update', 'dashboard.delete',
+    'data.read',
     'context.read', 'context.manage',
     'scope.read', 'scope.update',
   ],
-  [USER]: ['dashboard.read', 'data.read'],
+  [USER]: ['dashboard.read', 'dashboard.create', 'dashboard.update', 'data.read'],
 };
 
 /**
@@ -146,7 +149,6 @@ const PLATFORM_ONLY_PERMISSIONS = new Set([
   'company.delete',
   'role.update',
   'dashboard.assign',
-  'dashboard.update',
 ]);
 
 /**

@@ -131,6 +131,17 @@ const TABLES = [
    *
    * dashboard_id carries no foreign key on purpose: dashboards are files.
    */
+  `CREATE TABLE IF NOT EXISTS ${T.dashboards} (
+     id           VARCHAR(64)  PRIMARY KEY,
+     title        VARCHAR(150) NOT NULL,
+     description  TEXT         NULL,
+     company_id   INTEGER      NULL REFERENCES ${T.companies} (id) ON DELETE CASCADE,
+     created_by   INTEGER      NULL REFERENCES ${T.users} (id) ON DELETE SET NULL,
+     spec         JSONB        NOT NULL,
+     created_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),
+     updated_at   TIMESTAMPTZ  NOT NULL DEFAULT now()
+   )`,
+
   `CREATE TABLE IF NOT EXISTS ${T.companyDashboards} (
      company_id   INTEGER     NOT NULL REFERENCES ${T.companies} (id) ON DELETE CASCADE,
      dashboard_id VARCHAR(64) NOT NULL,
@@ -257,6 +268,8 @@ const INDEXES = [
   `CREATE INDEX IF NOT EXISTS idx_users_company ON ${T.users} (company_id)`,
   `CREATE INDEX IF NOT EXISTS idx_groups_creator ON ${T.groups} (creator_id)`,
   `CREATE INDEX IF NOT EXISTS idx_group_users_user ON ${T.groupUsers} (user_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_dashboards_company ON ${T.dashboards} (company_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_dashboards_creator ON ${T.dashboards} (created_by)`,
   `CREATE INDEX IF NOT EXISTS idx_company_dashboards_dashboard ON ${T.companyDashboards} (dashboard_id)`,
   `CREATE INDEX IF NOT EXISTS idx_dashboard_access_dashboard ON ${T.dashboardAccess} (dashboard_id)`,
   `CREATE INDEX IF NOT EXISTS idx_group_dashboard_access_dashboard ON ${T.groupDashboardAccess} (dashboard_id)`,
@@ -373,6 +386,20 @@ async function seedRoles() {
     );
   }
 
+  // Ensure dashboard lifecycle permissions (dashboard.create, dashboard.update, dashboard.delete)
+  // are seeded for company roles even if the permission log already recorded them.
+  for (const [roleName, permissions] of Object.entries(DEFAULT_ROLE_PERMISSIONS)) {
+    for (const permissionId of permissions) {
+      if (permissionId.startsWith('dashboard.')) {
+        await db.query(
+          `INSERT INTO ${T.rolePermissions} (role_name, permission_id) VALUES (?, ?)
+           ON CONFLICT DO NOTHING`,
+          [roleName, permissionId]
+        );
+      }
+    }
+  }
+
   // Recorded whether or not anything was granted: what the log means is "the
   // catalogue contained this", not "somebody holds it".
   for (const permissionId of PERMISSION_IDS) {
@@ -438,6 +465,41 @@ async function seedSuperAdmin() {
   return true;
 }
 
+async function seedDefaultDashboards() {
+  const fs = require('fs');
+  const path = require('path');
+  const { DASHBOARD_CONFIG_DIR } = require('../config/env');
+  const { normalizeSpec } = require('../dashboard/cardModel');
+
+  if (!fs.existsSync(DASHBOARD_CONFIG_DIR)) return;
+  let files = [];
+  try {
+    files = fs.readdirSync(DASHBOARD_CONFIG_DIR).filter((f) => f.endsWith('.json'));
+  } catch (_) {
+    return;
+  }
+
+  for (const file of files) {
+    try {
+      const id = path.basename(file, '.json');
+      const raw = fs.readFileSync(path.join(DASHBOARD_CONFIG_DIR, file), 'utf8');
+      const parsed = JSON.parse(raw.replace(/^\uFEFF/, ''));
+      const spec = normalizeSpec(parsed);
+      const title = spec.title || id;
+      const description = spec.description || null;
+
+      await db.query(
+        `INSERT INTO ${T.dashboards} (id, title, description, company_id, created_by, spec)
+         VALUES (?, ?, ?, NULL, NULL, ?)
+         ON CONFLICT (id) DO NOTHING`,
+        [id, title, description, JSON.stringify(spec)]
+      );
+    } catch (err) {
+      console.warn(`[rbac] failed to seed dashboard from ${file}:`, err.message);
+    }
+  }
+}
+
 /**
  * Creates the database, tables, indexes and seed rows when they are missing.
  * Resolves once the RBAC layer is usable.
@@ -449,6 +511,7 @@ async function bootstrapAppMeta() {
 
     await seedRoles();
     await seedSuperAdmin();
+    await seedDefaultDashboards();
 
     // Feature modules own their own tables. Created after the RBAC ones,
     // because they reference companies and users.

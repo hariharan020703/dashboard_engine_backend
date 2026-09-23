@@ -52,6 +52,7 @@ const T = {
   groups: q('groups'),
   groupUsers: q('group_users'),
   companyDashboards: q('company_dashboards'),
+  dashboards: q('dashboards'),
   dashboardAccess: q('dashboard_access'),
   groupDashboardAccess: q('group_dashboard_access'),
   userDataScope: q('user_data_scope'),

@@ -1,18 +1,15 @@
 const fs = require('fs');
 const path = require('path');
+const { db, T, withTransaction } = require('../config/database');
 const { DASHBOARD_CONFIG_DIR } = require('../config/env');
 const { normalizeSpec } = require('./cardModel');
 
 /**
  * Resolves a dashboardId to its dashboard JSON.
  *
- * Storage is deliberately plain files, no database — dashboard metadata is
- * runtime configuration, so it lives under backend/config/dashboards:
- *   config/dashboards/<dashboardId>.json   one file per dashboard
- *   config/dashboards/default.json         served when no id is supplied
- *
- * The Query Engine never sees a dashboard id: it only ever receives a resolved
- * spec object, so adding dashboards needs no engine change.
+ * Dashboards are stored in the PostgreSQL `dashboards` table. For development
+ * and backward compatibility, files in `config/dashboards/<dashboardId>.json`
+ * serve as initial templates and fallbacks.
  */
 
 const DASHBOARD_DIR = process.env.DASHBOARD_DIR
@@ -22,7 +19,7 @@ const DASHBOARD_DIR = process.env.DASHBOARD_DIR
 const DEFAULT_SPEC_PATH = path.join(DASHBOARD_DIR, 'default.json');
 const DEFAULT_DASHBOARD_ID = process.env.DEFAULT_DASHBOARD_ID || 'default';
 
-// Ids become file names, so the allowlist is also the path-traversal guard.
+// Ids become identifier strings, so the allowlist guards URL & path traversal.
 const DASHBOARD_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 class InvalidDashboardIdError extends Error {
@@ -54,11 +51,10 @@ function assertValidDashboardId(dashboardId) {
 
 function readSpecFile(filePath) {
   const raw = fs.readFileSync(filePath, 'utf8');
-  const spec = JSON.parse(raw.replace(/^﻿/, ''));
+  const spec = JSON.parse(raw.replace(/^\uFEFF/, ''));
   if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
     throw new Error(`Dashboard file ${path.basename(filePath)} does not contain a dashboard object`);
   }
-  // Every consumer sees one ordered `cards` list, whatever shape the file uses.
   return normalizeSpec(spec);
 }
 
@@ -76,7 +72,6 @@ function registryPathFor(dashboardId) {
   return path.join(DASHBOARD_DIR, `${assertValidDashboardId(dashboardId)}.json`);
 }
 
-/** Absolute path backing a dashboard id, or null when nothing backs it yet. */
 function specPathFor(dashboardId) {
   const id = assertValidDashboardId(dashboardId);
   const registryPath = registryPathFor(id);
@@ -87,41 +82,72 @@ function specPathFor(dashboardId) {
   return null;
 }
 
-function resolveSpec(dashboardId) {
+/** Resolves dashboard spec by id from DB or disk cache. */
+async function resolveSpec(dashboardId) {
   const id = assertValidDashboardId(dashboardId);
   const cached = specCache.get(id);
   if (cached) return cached;
 
-  const filePath = specPathFor(id);
-  if (!filePath) throw new DashboardNotFoundError(id);
+  // 1. Try DB first
+  try {
+    const { rows } = await db.query(
+      `SELECT id, title, description, company_id, spec FROM ${T.dashboards} WHERE id = ?`,
+      [id]
+    );
+    if (rows.length) {
+      let spec = rows[0].spec;
+      if (typeof spec === 'string') spec = JSON.parse(spec);
+      spec = normalizeSpec(spec);
+      if (!spec.id) spec.id = rows[0].id;
+      if (!spec.title && rows[0].title) spec.title = rows[0].title;
+      if (!spec.description && rows[0].description) spec.description = rows[0].description;
+      spec.companyId = rows[0].company_id;
+      specCache.set(id, spec);
+      return spec;
+    }
+  } catch (err) {
+    // If DB is initializing, continue to disk fallback
+  }
 
-  const spec = readSpecFile(filePath);
-  specCache.set(id, spec);
-  return spec;
+  // 2. Fallback to file on disk
+  const filePath = specPathFor(id);
+  if (filePath) {
+    const spec = readSpecFile(filePath);
+    specCache.set(id, spec);
+    return spec;
+  }
+
+  throw new DashboardNotFoundError(id);
 }
 
 /** The dashboard served when no id is supplied. */
-function resolveDefaultSpec() {
-  if (fs.existsSync(DEFAULT_SPEC_PATH)) {
-    const cached = specCache.get(DEFAULT_DASHBOARD_ID);
-    if (cached) return cached;
-    const spec = readSpecFile(DEFAULT_SPEC_PATH);
-    specCache.set(DEFAULT_DASHBOARD_ID, spec);
-    return spec;
+async function resolveDefaultSpec() {
+  if (specCache.has(DEFAULT_DASHBOARD_ID)) {
+    return specCache.get(DEFAULT_DASHBOARD_ID);
   }
-  const first = listDashboards()[0];
-  if (!first) throw new DashboardNotFoundError(DEFAULT_DASHBOARD_ID);
-  return resolveSpec(first.id);
+
+  try {
+    return await resolveSpec(DEFAULT_DASHBOARD_ID);
+  } catch (_) {
+    const defId = defaultSpecId();
+    if (defId) {
+      try {
+        return await resolveSpec(defId);
+      } catch (_) {}
+    }
+    const all = await listDashboards();
+    if (!all.length) throw new DashboardNotFoundError(DEFAULT_DASHBOARD_ID);
+    return await resolveSpec(all[0].id);
+  }
 }
 
 function defaultDashboardId() {
   return DEFAULT_DASHBOARD_ID;
 }
 
-function listDashboards() {
+function listDiskDashboards() {
   const entries = [];
   const seen = new Set();
-
   let files = [];
   try {
     files = fs.readdirSync(DASHBOARD_DIR);
@@ -140,38 +166,100 @@ function listDashboards() {
       title = undefined;
     }
     seen.add(id);
-    entries.push({ id, title, source: 'registry' });
+    entries.push({ id, title, companyId: null, source: 'file' });
   }
 
-  if (fs.existsSync(DEFAULT_SPEC_PATH)) {
-    let spec = {};
-    try {
-      spec = readSpecFile(DEFAULT_SPEC_PATH);
-    } catch (_) {
-      spec = {};
+  return entries;
+}
+
+/**
+ * Lists all known dashboards from database + disk.
+ *
+ * If companyId is supplied (number), lists dashboards for that company plus
+ * platform templates. If companyId is null, lists platform templates only.
+ * If companyId is undefined, lists all dashboards (platform view).
+ */
+async function listDashboards(companyId = undefined) {
+  const entries = [];
+  const seen = new Set();
+
+  try {
+    let sql = `SELECT id, title, description, company_id AS "companyId", created_by AS "createdBy"
+                 FROM ${T.dashboards}`;
+    const params = [];
+    if (companyId !== undefined) {
+      if (companyId === null) {
+        sql += ' WHERE company_id IS NULL';
+      } else {
+        sql += ' WHERE company_id = ? OR company_id IS NULL';
+        params.push(companyId);
+      }
     }
-    // The default dashboard is also addressable by the id declared inside it.
-    for (const id of [DEFAULT_DASHBOARD_ID, defaultSpecId()]) {
-      if (!id || seen.has(id) || !DASHBOARD_ID_RE.test(id)) continue;
-      seen.add(id);
-      entries.push({ id, title: spec.title, source: 'alias' });
+    sql += ' ORDER BY title ASC';
+
+    const { rows } = await db.query(sql, params);
+    for (const row of rows) {
+      seen.add(row.id);
+      entries.push({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        companyId: row.companyId,
+        createdBy: row.createdBy,
+        source: 'database',
+      });
+    }
+  } catch (_) {
+    // If DB is not yet ready, ignore and fall back to disk
+  }
+
+  const disk = listDiskDashboards();
+  for (const d of disk) {
+    if (!seen.has(d.id)) {
+      seen.add(d.id);
+      entries.push(d);
     }
   }
 
   return entries;
 }
 
-function saveSpec(dashboardId, spec) {
+/** Saves or updates a dashboard in the database and invalidates the cache. */
+async function saveSpec(
+  dashboardId,
+  spec,
+  { companyId = null, userId = null, title = null, description = null } = {}
+) {
   const id = assertValidDashboardId(dashboardId);
-  // Writes stay where the dashboard already lives; new ids land in the registry.
-  let target = specPathFor(id);
-  if (!target) {
-    fs.mkdirSync(DASHBOARD_DIR, { recursive: true });
-    target = registryPathFor(id);
-  }
-  fs.writeFileSync(target, JSON.stringify(spec, null, 2) + '\n');
+  const normalized = normalizeSpec(spec);
+  const resolvedTitle = title || normalized.title || id;
+  const resolvedDesc = description !== undefined ? description : (normalized.description || null);
+
+  await db.query(
+    `INSERT INTO ${T.dashboards} (id, title, description, company_id, created_by, spec, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, now())
+     ON CONFLICT (id) DO UPDATE SET
+       title = EXCLUDED.title,
+       description = EXCLUDED.description,
+       spec = EXCLUDED.spec,
+       updated_at = now()`,
+    [id, resolvedTitle, resolvedDesc, companyId, userId, JSON.stringify(normalized)]
+  );
+
   invalidateSpecCache(id);
-  return target;
+  return id;
+}
+
+/** Permanently deletes a dashboard from database, assignments, and grants. */
+async function deleteDashboard(dashboardId) {
+  const id = assertValidDashboardId(dashboardId);
+  await withTransaction(async (conn) => {
+    await conn.query(`DELETE FROM ${T.dashboardAccess} WHERE dashboard_id = ?`, [id]);
+    await conn.query(`DELETE FROM ${T.groupDashboardAccess} WHERE dashboard_id = ?`, [id]);
+    await conn.query(`DELETE FROM ${T.companyDashboards} WHERE dashboard_id = ?`, [id]);
+    await conn.query(`DELETE FROM ${T.dashboards} WHERE id = ?`, [id]);
+  });
+  invalidateSpecCache(id);
 }
 
 function invalidateSpecCache(dashboardId) {
@@ -181,7 +269,6 @@ function invalidateSpecCache(dashboardId) {
   }
   const id = String(dashboardId);
   specCache.delete(id);
-  // The default file backs both the default id and its own declared id.
   if (specPathFor(DEFAULT_DASHBOARD_ID) === DEFAULT_SPEC_PATH) {
     specCache.delete(DEFAULT_DASHBOARD_ID);
     const aliasId = defaultSpecId();
@@ -195,5 +282,8 @@ module.exports = {
   defaultDashboardId,
   listDashboards,
   saveSpec,
+  deleteDashboard,
   invalidateSpecCache,
+  assertValidDashboardId,
+  DashboardNotFoundError,
 };

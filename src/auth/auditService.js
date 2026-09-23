@@ -55,9 +55,11 @@ const EVENTS = {
   GROUP_UPDATED: 'group_updated',
   GROUP_DELETED: 'group_deleted',
 
+  DASHBOARD_CREATED: 'dashboard_created',
   DASHBOARD_ASSIGNED: 'dashboard_assigned',
   DASHBOARD_UNASSIGNED: 'dashboard_unassigned',
   DASHBOARD_UPDATED: 'dashboard_updated',
+  DASHBOARD_DELETED: 'dashboard_deleted',
   ACCESS_GRANTED: 'access_granted',
   ACCESS_REVOKED: 'access_revoked',
   ACCESS_DENIED: 'access_denied',

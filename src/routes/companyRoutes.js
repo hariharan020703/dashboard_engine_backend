@@ -164,7 +164,7 @@ router.get('/:id/dashboards', requirePermission('dashboard.assign'), async (req,
 router.put('/:id/dashboards/:dashboardId', requirePermission('dashboard.assign'), async (req, res) => {
   const id = requireId(req.params.id, 'company id');
   await companies.requireCompany(req.actor, id);
-  const dashboardId = access.requireDashboardId(req.params.dashboardId);
+  const dashboardId = await access.requireDashboardId(req.params.dashboardId);
 
   await access.assignDashboard(id, dashboardId, req.actor.id);
   audit(EVENTS.DASHBOARD_ASSIGNED, req.actor, { companyId: id, dashboardId });
