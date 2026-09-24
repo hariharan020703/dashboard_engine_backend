@@ -118,7 +118,17 @@ async function start() {
   await verifyEmailTransport();
   startHousekeeping();
 
-  app.listen(PORT, () => {
+  // Express 5 hands a bind failure (EADDRINUSE) to this callback rather than
+  // throwing. Ignoring it prints "running" for a server that holds no socket,
+  // and the process then exits silently once the pg pool's idle clients time out.
+  app.listen(PORT, (err) => {
+    if (err) {
+      console.error(`[startup] cannot listen on port ${PORT}: ${err.code || err.message}`);
+      if (err.code === 'EADDRINUSE') {
+        console.error('[startup] another process owns this port - often the docker-compose `web` container. Stop it or set PORT.');
+      }
+      process.exit(1);
+    }
     console.log(`Backend running on http://localhost:${PORT}`);
     console.log(`Application URL (used in email links): ${APPLICATION_URL}`);
   });

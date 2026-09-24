@@ -69,6 +69,7 @@ const EVENTS = {
   CONTEXT_DATASETS_SELECTED: 'context_datasets_selected',
   CONTEXT_REVIEW_DECIDED: 'context_review_decided',
   CONTEXT_PUBLISHED: 'context_published',
+  CONTEXT_EXTRACTION_RUN: 'context_extraction_run',
 };
 
 const KNOWN_EVENTS = new Set(Object.values(EVENTS));

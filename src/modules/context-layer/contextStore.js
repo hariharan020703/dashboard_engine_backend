@@ -94,6 +94,41 @@ function asMissingStore(err) {
   throw err;
 }
 
+/**
+ * The latest run's facts, in the ADK API's `/context-objects` response shape.
+ *
+ * Same shape on purpose, so Understand renders one list whichever service
+ * answered. Used in demo mode, when the ADK API is not what wrote the rows.
+ */
+async function listContextObjects(connectionId) {
+  let rows;
+  try {
+    rows = await loadObjects(connectionId);
+  } catch (err) {
+    asMissingStore(err);
+  }
+  return {
+    workspace_id: connectionId,
+    resolved_session_id: rows.length ? rows[0].session_id : null,
+    count: rows.length,
+    objects: rows.map((row) => ({
+      id: row.id,
+      bundle_id: null,
+      session_id: row.session_id,
+      object_type: row.object_type,
+      qualified_name: row.qualified_name,
+      source_type: row.source_type,
+      verified: row.verified,
+      confidence: row.confidence === null ? null : Number(row.confidence),
+      payload: row.payload,
+      reviewed_by: row.reviewed_by,
+      reviewed_at: row.reviewed_at,
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    })),
+  };
+}
+
 /* ------------------------------------------------------------------ model --- */
 
 /** The table a `column_stats` row belongs to: everything before the last dot. */
@@ -417,6 +452,7 @@ async function bulkDecide(actor, connectionId, { decision, filter = {} } = {}) {
 
 module.exports = {
   loadObjects,
+  listContextObjects,
   modelGraph,
   reviewQueue,
   decideReviewItem,

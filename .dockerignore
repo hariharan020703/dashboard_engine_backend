@@ -1,0 +1,7 @@
+node_modules
+logs
+.git
+# Configuration comes from docker-compose (env_file), never baked into the image.
+.env
+.env.*
+!.env.example

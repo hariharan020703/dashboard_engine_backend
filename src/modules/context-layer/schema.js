@@ -42,7 +42,9 @@ const CT = {
    * service has to change for the other.
    */
   reviews: q('context_object_reviews'),
+  // Legacy: superseded by `versions`, kept so its rows can be copied across.
   publications: q('context_publications'),
+  versions: q('context_layer_versions'),
 };
 
 const TABLES = [
@@ -154,6 +156,63 @@ const TABLES = [
      published_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
      CONSTRAINT uq_context_publication_version UNIQUE (connection_id, name, version)
    )`,
+
+  /*
+   * One version of a context, from first edit to publication.
+   *
+   * Replaces `context_publications`, which could only record the END of the
+   * workflow. A context now exists from the moment somebody starts building
+   * it: the first write in the builder (a connection, a dataset selection, an
+   * extraction, a review decision) opens a `draft`, and publishing turns that
+   * same row into `published`.
+   *
+   * Editing after publication never touches the published row. The next write
+   * opens a NEW draft - version n+1, `based_on_id` pointing at what it was
+   * edited from - so v1 stays exactly as it was published while v2 is being
+   * worked on. Hence at most one draft per connection (the partial unique
+   * index below) and any number of published rows.
+   *
+   * The version counts per (connection, name), as publications always did:
+   * republishing "Revenue" makes v2 of Revenue, while "Site safety" from the
+   * same connection starts at v1. A draft carries the version it WILL get
+   * under its current name; publishing under a different name recomputes it.
+   *
+   * `snapshot` holds the approved facts as they were at publication. It is
+   * empty on a draft - a draft's facts are the live `context_objects` rows,
+   * which is exactly why the published copy has to be stored.
+   *
+   * `extraction_*` is the report of the run that produced this version's facts.
+   * The rows themselves live in `context_objects`; the prose account of the run
+   * lives here so Understand can show it again after a reload.
+   */
+  `CREATE TABLE IF NOT EXISTS ${CT.versions} (
+     id                UUID         PRIMARY KEY,
+     connection_id     UUID         NOT NULL REFERENCES ${CT.connections} (id) ON DELETE CASCADE,
+     company_id        INTEGER      NOT NULL REFERENCES ${T.companies} (id) ON DELETE CASCADE,
+     name              VARCHAR(120) NOT NULL,
+     version           INTEGER      NOT NULL,
+     status            VARCHAR(16)  NOT NULL DEFAULT 'draft',
+     current_step      VARCHAR(16)  NULL,
+     dataset_ids       JSONB        NOT NULL DEFAULT '[]'::jsonb,
+     based_on_id       UUID         NULL REFERENCES ${CT.versions} (id) ON DELETE SET NULL,
+     session_id        TEXT         NULL,
+     extraction_mode   VARCHAR(16)  NULL,
+     extraction_report TEXT         NULL,
+     extracted_at      TIMESTAMPTZ  NULL,
+     object_count      INTEGER      NOT NULL DEFAULT 0,
+     stats             JSONB        NOT NULL DEFAULT '{}'::jsonb,
+     snapshot          JSONB        NOT NULL DEFAULT '[]'::jsonb,
+     notify_team       BOOLEAN      NOT NULL DEFAULT FALSE,
+     created_by        INTEGER      NULL REFERENCES ${T.users} (id) ON DELETE SET NULL,
+     created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+     published_by      INTEGER      NULL REFERENCES ${T.users} (id) ON DELETE SET NULL,
+     published_at      TIMESTAMPTZ  NULL,
+     CONSTRAINT chk_context_version_status CHECK (status IN ('draft','published')),
+     CONSTRAINT chk_context_version_published
+       CHECK (status <> 'published' OR published_at IS NOT NULL),
+     CONSTRAINT uq_context_layer_version UNIQUE (connection_id, name, version)
+   )`,
 ];
 
 const INDEXES = [
@@ -164,12 +223,38 @@ const INDEXES = [
      ON ${CT.publications} (connection_id, published_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_context_publications_company
      ON ${CT.publications} (company_id)`,
+  // At most one draft per connection: the thing being edited right now.
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_context_layer_one_draft
+     ON ${CT.versions} (connection_id) WHERE status = 'draft'`,
+  `CREATE INDEX IF NOT EXISTS idx_context_layer_versions_connection
+     ON ${CT.versions} (connection_id, created_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_context_layer_versions_company
+     ON ${CT.versions} (company_id)`,
 ];
+
+/*
+ * Carries every row of the legacy publications table into `versions`.
+ *
+ * Same id, so it runs on every start and copies each row exactly once:
+ * ON CONFLICT DO NOTHING skips anything already there, by id or by
+ * (connection, name, version). Nothing writes the legacy table any more.
+ */
+const BACKFILL = `
+  INSERT INTO ${CT.versions}
+    (id, connection_id, company_id, name, version, status, current_step, session_id,
+     object_count, stats, snapshot, notify_team, created_by, created_at, updated_at,
+     published_by, published_at)
+  SELECT id, connection_id, company_id, name, version, 'published', 'publish', session_id,
+         object_count, stats, snapshot, notify_team, published_by, published_at, published_at,
+         published_by, published_at
+    FROM ${CT.publications}
+  ON CONFLICT DO NOTHING`;
 
 /** Creates this module's tables. Idempotent; called once at startup. */
 async function bootstrapContextLayer() {
   for (const ddl of TABLES) await db.raw(ddl);
   for (const ddl of INDEXES) await db.raw(ddl);
+  await db.raw(BACKFILL);
 }
 
 module.exports = { CT, bootstrapContextLayer };

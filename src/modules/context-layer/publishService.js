@@ -1,8 +1,7 @@
-const crypto = require('crypto');
-const { db, withTransaction } = require('../../config/database');
-const { quoteIdentifier } = require('../../config/pgPool');
+const { withTransaction } = require('../../config/database');
 const { fail, requireString } = require('../../api/response');
 const { loadObjects, reviewStatusOf } = require('./contextStore');
+const versions = require('./versionService');
 
 /**
  * Publishing a context: giving a reviewed set of facts a name and a version.
@@ -21,10 +20,11 @@ const { loadObjects, reviewStatusOf } = require('./contextStore');
  * only a list of ids would change underneath whoever is reading it the next
  * time somebody edits a description - which is the one thing a version is
  * supposed to prevent.
+ *
+ * Where it is stored: `context_layer_versions` (see versionService.js). The
+ * version being built is a `draft` row; publishing flips that same row to
+ * `published`, and the next edit opens a new draft for version n+1.
  */
-
-const q = quoteIdentifier;
-const PUBLICATIONS = q('context_publications');
 
 /** Only approved facts are published. Everything else is still somebody's decision. */
 function publishable(rows) {
@@ -108,14 +108,18 @@ async function publishSummary(actor, connection) {
     });
   }
 
-  const previous = await latestPublication(connection.id);
+  const [previous, draft] = await Promise.all([
+    versions.latestPublished(connection.id),
+    versions.currentDraft(connection.id),
+  ]);
 
   return {
     connectionId: connection.id,
-    // Defaults to the connection's own name, because it is better than an
-    // empty box - but it is a starting point, not the answer. See `publish`.
-    suggestedName: previous ? previous.name : connection.name,
+    // The draft's name, then the last published one, then the connection's -
+    // a starting point, not the answer. See `publishContext`.
+    suggestedName: draft ? draft.name : previous ? previous.name : connection.name,
     previousVersion: previous ? previous.version : null,
+    draft,
     stats,
     datasets: (connection.selectedDatasets || []).map((dataset) => ({
       id: dataset.id,
@@ -146,51 +150,35 @@ async function validatePublish(actor, connection) {
   };
 }
 
-async function latestPublication(connectionId) {
-  const { rows } = await db.query(
-    `SELECT id, name, version, published_at, object_count
-       FROM ${PUBLICATIONS}
-      WHERE connection_id = ?::uuid
-      ORDER BY published_at DESC
-      LIMIT 1`,
-    [connectionId]
-  );
-  return rows[0] || null;
-}
-
-/** Every version published under one connection, newest first. */
+/** Every PUBLISHED version under one connection, newest first. */
 async function listPublications(connectionId) {
-  const { rows } = await db.query(
-    `SELECT id, name, version, session_id, object_count, stats, published_by, published_at
-       FROM ${PUBLICATIONS}
-      WHERE connection_id = ?::uuid
-      ORDER BY published_at DESC`,
-    [connectionId]
-  );
-  return rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    version: row.version,
-    sessionId: row.session_id,
-    objectCount: Number(row.object_count),
-    stats: row.stats,
-    publishedBy: row.published_by,
-    publishedAt: row.published_at,
-  }));
+  const state = await versions.versionState({ id: connectionId });
+  return state.versions
+    .filter((v) => v.status === 'published')
+    .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))
+    .map((v) => ({
+      id: v.id,
+      name: v.name,
+      version: v.version,
+      sessionId: v.sessionId,
+      objectCount: v.objectCount,
+      stats: v.stats,
+      publishedBy: v.publishedBy,
+      publishedAt: v.publishedAt,
+    }));
 }
 
 /**
- * Writes the snapshot.
+ * Publishes the open draft.
  *
  * The version is per NAME, not per connection: republishing "Revenue" makes
  * v2 of Revenue, and publishing "Site safety" from the same connection starts
  * at v1. That is what somebody means by a version - the history of this named
  * thing, not of the credential it happened to come from.
  *
- * Computed inside the transaction, so two people publishing the same name at
- * once cannot both read v1 and both write v2; the unique index on
- * (connection_id, name, version) is what actually enforces it, and the retry
- * is the caller's.
+ * Computed inside the transaction, with the draft row locked, so two people
+ * publishing at once cannot both read v1 and both write v2; the unique index
+ * on (connection_id, name, version) is what finally enforces it.
  */
 async function publishContext(actor, connection, { name, notifyTeam = false } = {}) {
   const cleanName = requireString(name, 'Context name', { min: 2, max: 120 });
@@ -205,62 +193,37 @@ async function publishContext(actor, connection, { name, notifyTeam = false } = 
   }
 
   const counts = countByType(approved);
-  const sessionId = approved[0].session_id || null;
-  const id = crypto.randomUUID();
+  /*
+   * The facts themselves, as they were at this moment. Stored rather than
+   * referenced: a published version that pointed at live rows would change
+   * whenever somebody edited a description, which is precisely what a version
+   * exists to prevent.
+   */
+  const snapshot = approved.map((row) => ({
+    id: row.id,
+    objectType: row.object_type,
+    qualifiedName: row.qualified_name,
+    sourceType: row.source_type,
+    confidence: row.confidence === null ? null : Number(row.confidence),
+    payload: row.payload,
+  }));
 
-  const published = await withTransaction(async (conn) => {
-    const { rows: previous } = await conn.query(
-      `SELECT COALESCE(MAX(version), 0) AS v
-         FROM ${PUBLICATIONS}
-        WHERE connection_id = ?::uuid AND name = ?`,
-      [connection.id, cleanName]
-    );
-    const version = Number(previous[0].v) + 1;
-
-    await conn.query(
-      `INSERT INTO ${PUBLICATIONS}
-         (id, connection_id, company_id, name, version, session_id,
-          object_count, stats, snapshot, published_by, notify_team)
-       VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?, ?)`,
-      [
-        id,
-        connection.id,
-        connection.companyId,
-        cleanName,
-        version,
-        sessionId,
-        approved.length,
-        JSON.stringify({ counts, tables: tablesCovered(approved) }),
-        /*
-         * The facts themselves, as they were at this moment. Stored rather
-         * than referenced: a published version that pointed at live rows
-         * would change whenever somebody edited a description, which is
-         * precisely what a version exists to prevent.
-         */
-        JSON.stringify(
-          approved.map((row) => ({
-            id: row.id,
-            objectType: row.object_type,
-            qualifiedName: row.qualified_name,
-            sourceType: row.source_type,
-            confidence: row.confidence === null ? null : Number(row.confidence),
-            payload: row.payload,
-          }))
-        ),
-        actor.id,
-        Boolean(notifyTeam),
-      ]
-    );
-
-    return { version };
-  });
+  const published = await withTransaction((conn) =>
+    versions.publishDraft(conn, actor, connection, {
+      name: cleanName,
+      snapshot,
+      stats: { counts, tables: tablesCovered(approved) },
+      sessionId: approved[0].session_id || null,
+      notifyTeam,
+    })
+  );
 
   return {
-    id,
-    name: cleanName,
-    version: `v${published.version}`,
-    publishedAt: new Date().toISOString(),
-    objectCount: approved.length,
+    id: published.id,
+    name: published.name,
+    version: published.label,
+    publishedAt: published.publishedAt,
+    objectCount: published.objectCount,
     status: 'published',
   };
 }
@@ -270,5 +233,4 @@ module.exports = {
   validatePublish,
   publishContext,
   listPublications,
-  latestPublication,
 };

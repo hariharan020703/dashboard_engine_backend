@@ -13,6 +13,9 @@ const { CONNECTORS, findConnector, STATUS } = require('./connectorCatalogue');
 const connections = require('./connectionService');
 const contextStore = require('./contextStore');
 const publish = require('./publishService');
+const versions = require('./versionService');
+const demo = require('./demoExtraction');
+const { EXTRACTION_MODE } = require('./extractionMode');
 
 /**
  * The context layer: warehouse connections, and the datasets chosen from them.
@@ -54,6 +57,22 @@ function readLimit(raw) {
   return value;
 }
 
+/**
+ * Records a change against the connection's draft, opening one if needed.
+ *
+ * Best-effort by design: the change itself has already been saved, and
+ * failing the request now would tell somebody their selection or decision was
+ * lost when it was not. The miss is logged, and the next write catches the
+ * draft up - `touchDraft` only ever moves it forward.
+ */
+async function recordDraft(actor, connection, patch) {
+  try {
+    await versions.touchDraft(actor, connection, patch);
+  } catch (err) {
+    console.warn(`[context] could not update the draft for ${connection.id}: ${err.message}`);
+  }
+}
+
 /* ------------------------------------------------------------- catalogue --- */
 
 // GET /api/context/connectors - what can be connected, and what is coming
@@ -61,11 +80,25 @@ router.get('/connectors', requirePermission('context.read'), (req, res) => {
   ok(res, CONNECTORS);
 });
 
+/*
+ * GET /api/context/settings - deployment facts the builder needs.
+ *
+ * `extractionMode` decides whether step 4 calls the real agent or this
+ * backend's demo generator. Served rather than duplicated in a frontend env
+ * var, so flipping CONTEXT_EXTRACTION_MODE is the whole switch.
+ */
+router.get('/settings', requirePermission('context.read'), (req, res) => {
+  ok(res, { extractionMode: EXTRACTION_MODE });
+});
+
 /* ----------------------------------------------------------- connections --- */
 
 // GET /api/context/connections - this company's saved connections
 router.get('/connections', requirePermission('context.read'), async (req, res) => {
-  ok(res, await connections.listConnections(req.actor));
+  const list = await connections.listConnections(req.actor);
+  // Each card says whether its context is a draft or published, and which version.
+  const status = await versions.statusByConnection(list.map((c) => c.id));
+  ok(res, list.map((c) => ({ ...c, context: status.get(c.id) || null })));
 });
 
 /**
@@ -120,6 +153,9 @@ router.post('/connections', requirePermission('context.manage'), async (req, res
     datasetLimit: result.limit,
     datasetsTruncated: result.truncated,
   });
+
+  // Building a context starts here: v1's draft opens with the connection.
+  await recordDraft(req.actor, result.connection, { step: 'discover' });
 
   ok(res, result, 201);
 });
@@ -183,6 +219,63 @@ router.get(
   }
 );
 
+/* ------------------------------------------------- versions and step 4 --- */
+
+// GET .../versions - draft/published state and every version, newest first.
+router.get('/connections/:id/versions', requirePermission('context.read'), async (req, res) => {
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  ok(res, await versions.versionState(connection));
+});
+
+/*
+ * PATCH .../draft - where in the builder the open draft is.
+ *
+ * Moves the marker only. It never opens a draft: looking through a published
+ * context is not editing it, and must not mint a new version.
+ */
+router.patch('/connections/:id/draft', requirePermission('context.manage'), async (req, res) => {
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  ok(res, { draft: await versions.trackStep(connection, (req.body || {}).step) });
+});
+
+/*
+ * POST .../extraction - run the DEMO extraction (CONTEXT_EXTRACTION_MODE=demo).
+ *
+ * In agent mode the browser calls the ADK API directly and this route refuses,
+ * so a stale client cannot quietly write templated facts over an agent's.
+ */
+router.post('/connections/:id/extraction', requirePermission('context.manage'), async (req, res) => {
+  if (EXTRACTION_MODE !== 'demo') {
+    throw fail(
+      'VALIDATION_ERROR',
+      'The demo extraction is switched off (CONTEXT_EXTRACTION_MODE is not "demo"). The agent runs this step.'
+    );
+  }
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  const result = await demo.runDemoExtraction(req.actor, connection);
+
+  audit(EVENTS.CONTEXT_EXTRACTION_RUN, req.actor, {
+    connectionId: connection.id,
+    mode: 'demo',
+    sessionId: result.sessionId,
+    datasetIds: connection.selectedDatasets.map((d) => d.id),
+    objectCount: result.objectCount,
+  });
+  ok(res, result, 201);
+});
+
+// GET .../extraction - the latest stored extraction report, or null.
+router.get('/connections/:id/extraction', requirePermission('context.read'), async (req, res) => {
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  ok(res, await demo.latestExtraction(connection.id));
+});
+
+// GET .../context-objects - the latest run's facts, in the ADK API's shape.
+router.get('/connections/:id/context-objects', requirePermission('context.read'), async (req, res) => {
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  ok(res, await contextStore.listContextObjects(connection.id));
+});
+
 /* ------------------------------------------------- steps 5, 6 and 7 --- */
 
 /*
@@ -239,6 +332,7 @@ router.post(
       decision,
       edited: Boolean(update),
     });
+    await recordDraft(req.actor, connection, { step: 'review' });
     ok(res, item);
   }
 );
@@ -249,10 +343,14 @@ router.patch(
   requirePermission('context.manage'),
   async (req, res) => {
     const connection = await connectionFor(req);
-    ok(
-      res,
-      await contextStore.updateReviewItem(req.actor, connection.id, req.params.itemId, req.body || {})
+    const item = await contextStore.updateReviewItem(
+      req.actor,
+      connection.id,
+      req.params.itemId,
+      req.body || {}
     );
+    await recordDraft(req.actor, connection, { step: 'review' });
+    ok(res, item);
   }
 );
 
@@ -270,6 +368,7 @@ router.post(
       bulk: true,
       affected: result.affected,
     });
+    if (result.affected > 0) await recordDraft(req.actor, connection, { step: 'review' });
     ok(res, result);
   }
 );
@@ -336,6 +435,11 @@ router.put('/connections/:id/datasets', requirePermission('context.manage'), asy
     connectionId: connection.id,
     provider: connection.provider,
     companyId: connection.companyId,
+    datasetIds: connection.selectedDatasets.map((d) => d.id),
+  });
+
+  await recordDraft(req.actor, connection, {
+    step: 'profile',
     datasetIds: connection.selectedDatasets.map((d) => d.id),
   });
 

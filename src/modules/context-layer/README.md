@@ -68,6 +68,14 @@ feature does not collide with anything else:
 | `GET` | `/api/context/connections/:id/tables/:tableId` | `context.read` |
 | `PUT` | `/api/context/connections/:id/datasets` | `context.manage` |
 | `DELETE` | `/api/context/connections/:id` | `context.manage` |
+| `GET` | `/api/context/settings` | `context.read` |
+| `GET` | `/api/context/connections/:id/versions` | `context.read` |
+| `PATCH` | `/api/context/connections/:id/draft` | `context.manage` |
+| `POST` | `/api/context/connections/:id/extraction` | `context.manage` (demo mode only) |
+| `GET` | `/api/context/connections/:id/extraction` | `context.read` |
+| `GET` | `/api/context/connections/:id/context-objects` | `context.read` |
+
+Model, Review and Publish routes (`/model`, `/review…`, `/publish…`) are in `routes.js`.
 
 A connection belongs to exactly one company. A platform account must name the
 company on create; a company account gets its own and a `companyId` in the body
@@ -209,11 +217,48 @@ would be a claim the source never made.
 already company-scoped, so that is not the tenant boundary — it is the narrower statement
 that this endpoint profiles the datasets somebody chose, and nothing else in the instance.
 
+## Versions: draft → published → next draft
+
+`context_layer_versions` (`versionService.js`) holds one row per version of a context.
+
+- **A write opens the draft, never a read.** Creating the connection, saving the
+  selection, running an extraction and every review decision call `touchDraft`, which
+  reuses the connection's one open draft or opens one. `PATCH …/draft` only moves an
+  existing draft's `current_step` — stepping through a published context to look at it
+  must not mint a new version.
+- **Publishing flips the draft row to `published`** and stores the approved facts in
+  `snapshot`. The version is per `(connection, name)`: republishing "Revenue" makes v2,
+  a new name starts at v1.
+- **Editing after publishing opens a new row** — version n+1, `based_on_id` → what it was
+  edited from. The published row is never written again. A partial unique index allows
+  one draft per connection.
+- Draft bookkeeping on the ordinary routes is best-effort (`recordDraft` in `routes.js`):
+  the change itself is already saved, so a failed draft update is logged, not returned.
+- `context_publications` is legacy. Its rows are copied into `context_layer_versions` on
+  every start (same id, `ON CONFLICT DO NOTHING`) and nothing writes it any more.
+
+## Demo extraction (temporary)
+
+`CONTEXT_EXTRACTION_MODE=demo` makes step 4 run `demoExtraction.js` here instead of the
+ADK agent — for while the Anthropic credit is unavailable. It profiles each selected
+dataset live (the Profile call), then writes agent-shaped `context_objects` rows from the
+real columns: `table` / `column_stats` (verified, `bi_verified`), plus templated
+`metric`, `glossary`, `example` and name-matched `join` rows (unverified, `db_inferred`,
+pending review). Two tables selected, two tables of facts.
+
+It upserts in one statement, keeps a human's `verified` decision on re-run, and removes
+only rows an earlier *demo* run wrote. The report is stored on the draft
+(`extraction_report`) and returned with `mode: 'demo'` so the UI labels it.
+
+The frontend reads the mode from `GET /settings`, so **flipping the env var back to
+`agent` is the whole switch**; `demoExtraction.js`, `extractionMode.js` and the two
+`/extraction` routes can then be deleted.
+
 ## What this does not do
 
-Storing the chosen dataset ids, and profiling them, is where this feature stops. Building
-a context from them — definitions, metrics, relationships — is a separate step against a
-different service, and nothing here pretends to have done it.
+Building a context in agent mode — definitions, metrics, relationships — happens in a
+different service (the ADK API), and nothing here pretends to have done it. This module
+reads what that run wrote.
 
 ## Adding a provider
 
