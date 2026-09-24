@@ -1,17 +1,18 @@
 const { fail } = require('../api/response');
 const { isRbacReady } = require('../auth/appMetaSchema');
 const { verifyAccessToken } = require('../auth/tokenService');
-const { findUserById, getRolePermissions } = require('../auth/userService');
-const { getUserScopes } = require('../auth/scopeService');
+const { findActorRow, publicUser } = require('../auth/userService');
 const { buildActor, assertPermission } = require('../auth/authorization');
 const { assertDashboardLevel } = require('../auth/accessService');
 const { audit, EVENTS } = require('../auth/auditService');
+const { readAccessCookie, requireCsrf } = require('./session');
 
 /**
  * Request-level enforcement. Five guards, composed left to right on a route:
  *
  *   requireRbac              the metadata database is up
- *   requireAuth              a valid access token, resolved to a live account
+ *   requireAuth              a valid access-token cookie (plus the CSRF header on
+ *                            anything but a read), resolved to a live account
  *   requirePlatform          that account is not bounded by a company
  *   requirePermission(id)    that account's role holds a permission
  *   requireDashboard(level)  that account holds a level on :dashboardId
@@ -33,14 +34,17 @@ function requireRbac(req, res, next) {
   next();
 }
 
-/**
- * Bearer header only. Access tokens are not accepted in the query string: URLs
- * leak into access logs, proxy logs and browser history.
+/*
+ * The access token is read from its HttpOnly cookie only - never from a
+ * response body the client stored, never from an Authorization header, never
+ * from the query string (URLs leak into access logs, proxy logs and browser
+ * history). One way in means one thing to reason about; see session.js for why
+ * it is a cookie.
  */
-function bearerToken(req) {
-  const header = req.headers.authorization || '';
-  return header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-}
+
+// Methods that change nothing. Everything else must pass the CSRF check,
+// because a cookie is attached whether or not our own page sent the request.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
  * Resolves a token to a live account.
@@ -51,7 +55,8 @@ function bearerToken(req) {
  */
 async function actorFromToken(token) {
   const payload = verifyAccessToken(token);
-  const user = await findUserById(Number(payload.sub));
+  const found = await findActorRow(Number(payload.sub));
+  const user = found && found.user;
 
   if (!user) throw fail('UNAUTHENTICATED', 'This account no longer exists.');
   if (user.status === 'disabled') throw fail('ACCOUNT_DISABLED', 'This account has been deactivated.');
@@ -72,18 +77,36 @@ async function actorFromToken(token) {
     throw fail('UNAUTHENTICATED', 'Your access has changed. Please sign in again.');
   }
 
-  const permissions = await getRolePermissions(user.role);
-  const actor = buildActor(user, permissions);
-  actor.scopes = await getUserScopes(user.id);
+  const actor = buildActor(user, found.permissions);
+  actor.scopes = found.scopes;
   actor.familyId = payload.fam;
-  return actor;
+  return { actor, account: publicUser(user) };
 }
 
 async function requireAuth(req, res, next) {
-  const token = bearerToken(req);
+  // Already resolved for this request. /api/platform applies requireAuth and so
+  // do the routers mounted beneath it (companies, users), so without this every
+  // platform request resolved its actor twice - a second database round trip
+  // with nothing new to learn.
+  if (req.actor) return next();
+
+  const token = readAccessCookie(req);
   if (!token) return next(fail('UNAUTHENTICATED', 'Sign in to continue.'));
+
+  // Checked before the token is verified, so a forged cross-site request is
+  // refused without costing a database read.
+  if (!SAFE_METHODS.has(req.method)) {
+    let csrfError = null;
+    requireCsrf(req, res, (err) => { csrfError = err || null; });
+    if (csrfError) return next(csrfError);
+  }
+
   try {
-    req.actor = await actorFromToken(token);
+    const { actor, account } = await actorFromToken(token);
+    req.actor = actor;
+    // The browser-safe account row, already read above, for handlers that
+    // return it (/auth/me) - so none of them has to read it a second time.
+    req.account = account;
     next();
   } catch (err) {
     next(err);

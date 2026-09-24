@@ -1,4 +1,5 @@
 const express = require('express');
+const { parseListQuery } = require('../api/listQuery');
 const { ok, fail, requireId } = require('../api/response');
 const companies = require('../auth/companyService');
 const users = require('../auth/userService');
@@ -7,9 +8,9 @@ const { prepareInvitation } = require('../auth/onboardingService');
 const { assertCanAssignRole } = require('../auth/authorization');
 const { COMPANY_ADMIN } = require('../auth/permissionCatalogue');
 const { audit, EVENTS } = require('../auth/auditService');
-const { revokeAllForUser } = require('../auth/tokenService');
+const { revokeAllForCompany } = require('../auth/tokenService');
 const { sendEmail } = require('../email/emailService');
-const { db, T, withTransaction } = require('../config/database');
+const { withTransaction } = require('../config/database');
 const {
   requireRbac,
   requireAuth,
@@ -29,9 +30,17 @@ const router = express.Router();
 
 router.use(requireRbac, requireAuth, requirePasswordCurrent);
 
-// GET /api/companies - every company, or just the caller's own
+// GET /api/platform/companies - one page of companies.
+// ?page&pageSize&search&sort=name|status|users|dashboards|created&dir&active -> { items, total }
 router.get('/', requirePermission('company.read'), async (req, res) => {
-  ok(res, await companies.listCompanies(req.actor));
+  const list = parseListQuery(req.query, companies.COMPANY_SORTS, { sort: 'name', pageSize: 15 });
+  ok(res, await companies.listCompanies(req.actor, list, { active: req.query.active }));
+});
+
+// GET /api/platform/companies/options - [{ id, name, active }] for pickers.
+// Registered before /:id so "options" is not read as an id.
+router.get('/options', requirePermission('company.read'), async (req, res) => {
+  ok(res, await companies.listCompanyOptions(req.actor));
 });
 
 /**
@@ -104,7 +113,7 @@ router.post('/', requirePermission('company.create'), async (req, res) => {
 
 // GET /api/companies/:id - one company
 router.get('/:id', requirePermission('company.read'), async (req, res) => {
-  ok(res, await companies.requireCompany(req.actor, requireId(req.params.id, 'company id')));
+  ok(res, await companies.requireCompany(req.actor, requireId(req.params.id, 'company id'), { counts: true }));
 });
 
 // PATCH /api/companies/:id - rename, or activate and deactivate
@@ -119,11 +128,7 @@ router.patch('/:id', requirePermission('company.update'), async (req, res) => {
    * revoking here makes it immediate rather than eventual.
    */
   if (before.active && company.active === false) {
-    const { rows: users } = await db.query(
-      `SELECT id FROM ${T.users} WHERE company_id = ?`,
-      [id]
-    );
-    for (const user of users) await revokeAllForUser(user.id, 'company_disabled');
+    await revokeAllForCompany(id, 'company_disabled');
   }
 
   audit(EVENTS.COMPANY_UPDATED, req.actor, {

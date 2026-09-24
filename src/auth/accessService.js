@@ -37,49 +37,59 @@ function requireLevel(level) {
   return level;
 }
 
-/** A dashboard id the registry can resolve, or a 404. */
+/** A dashboard id the registry can resolve, or a 404. One lookup, not a listing. */
 async function requireDashboardId(dashboardId) {
   const id = String(dashboardId || '');
-  const all = await registry.listDashboards();
-  if (!all.some((d) => d.id === id)) {
+  if (!(await registry.dashboardExists(id))) {
     throw fail('DASHBOARD_NOT_FOUND', 'Dashboard not found');
   }
   return id;
 }
 
+/**
+ * What a dashboard LIST sends to the browser: enough to show and open one.
+ *
+ * Every list screen reads id, title and source, plus the one flag its list is
+ * about (accessLevel, assigned). description, companyId and createdBy are
+ * registry bookkeeping no list renders, so they stay on the server.
+ */
+function dashboardSummary(d, extra) {
+  return { id: d.id, title: d.title || null, source: d.source, ...extra };
+}
+
 /* ------------------------------------------------------------ assignments --- */
 
-/** Dashboard ids assigned to or owned by a company. */
+/*
+ * A dashboard is available to a company when it is assigned to it OR the
+ * company owns it. One statement, used both as a set and inside other queries.
+ */
+const COMPANY_DASHBOARD_IDS_SQL = `
+  SELECT dashboard_id FROM ${T.companyDashboards} WHERE company_id = ?
+  UNION
+  SELECT id FROM ${T.dashboards} WHERE company_id = ?`;
+
+/** Dashboard ids assigned to or owned by a company, in one round trip. */
 async function companyDashboardIds(companyId) {
-  const { rows: assigned } = await db.query(
-    `SELECT dashboard_id FROM ${T.companyDashboards} WHERE company_id = ?`,
-    [companyId]
-  );
-  let owned = [];
-  try {
-    const res = await db.query(
-      `SELECT id AS dashboard_id FROM ${T.dashboards} WHERE company_id = ?`,
-      [companyId]
-    );
-    owned = res.rows;
-  } catch (_) {}
-  return new Set([...assigned.map((r) => r.dashboard_id), ...owned.map((r) => r.dashboard_id)]);
+  const { rows } = await db.query(COMPANY_DASHBOARD_IDS_SQL, [companyId, companyId]);
+  return new Set(rows.map((r) => r.dashboard_id));
 }
 
 /** The dashboards a company may use, joined against the registry for titles. */
 async function listCompanyDashboards(companyId) {
-  const assigned = await companyDashboardIds(companyId);
-  const all = await registry.listDashboards(companyId);
-  return all
-    .filter((d) => assigned.has(d.id))
-    .map((d) => ({ ...d, assigned: true }));
+  const [assigned, all] = await Promise.all([
+    companyDashboardIds(companyId),
+    registry.listDashboards(companyId),
+  ]);
+  return all.filter((d) => assigned.has(d.id)).map((d) => dashboardSummary(d));
 }
 
 /** Every dashboard in the registry, flagged with whether this company has it. */
 async function listAssignableDashboards(companyId) {
-  const assigned = await companyDashboardIds(companyId);
-  const all = await registry.listDashboards();
-  return all.map((d) => ({ ...d, assigned: assigned.has(d.id) }));
+  const [assigned, all] = await Promise.all([
+    companyDashboardIds(companyId),
+    registry.listDashboards(),
+  ]);
+  return all.map((d) => dashboardSummary(d, { assigned: assigned.has(d.id) }));
 }
 
 async function assignDashboard(companyId, dashboardId, assignedBy) {
@@ -132,10 +142,22 @@ async function unassignDashboard(companyId, dashboardId) {
  */
 async function assertDashboardAssigned(actor, companyId, dashboardId) {
   if (actor.isPlatform && companyId === null) return;
-  const assigned = await companyDashboardIds(companyId);
-  if (!assigned.has(dashboardId)) {
+  if (!(await isDashboardAvailable(companyId, dashboardId))) {
     throw fail('TENANT_ACCESS_DENIED', 'That dashboard is not available to this company.');
   }
+}
+
+/** Whether one dashboard is assigned to or owned by a company - no set built. */
+async function isDashboardAvailable(companyId, dashboardId) {
+  const { rows } = await db.query(
+    `SELECT EXISTS (
+       SELECT 1 FROM ${T.companyDashboards} WHERE company_id = ? AND dashboard_id = ?
+       UNION ALL
+       SELECT 1 FROM ${T.dashboards} WHERE company_id = ? AND id = ?
+     ) AS available`,
+    [companyId, dashboardId, companyId, dashboardId]
+  );
+  return Boolean(rows[0] && rows[0].available);
 }
 
 /* ----------------------------------------------------------------- grants --- */
@@ -160,26 +182,55 @@ async function getAccessLevel(actor, dashboardId) {
     return 'admin';
   }
 
-  const assigned = await companyDashboardIds(actor.companyId);
-  if (!assigned.has(dashboardId)) return null;
+  /*
+   * Gate 1 (assignment) and gate 2 (grants) in ONE statement. This runs in
+   * front of every dashboard read, so as sequential queries it was several
+   * database round trips before the query engine could start.
+   */
+  const { rows: [gate] } = await db.query(
+    `SELECT EXISTS (
+              SELECT 1 FROM ${T.companyDashboards} WHERE company_id = ? AND dashboard_id = ?
+              UNION ALL
+              SELECT 1 FROM ${T.dashboards} WHERE company_id = ? AND id = ?
+            ) AS available,
+            ARRAY(
+              SELECT access_level FROM ${T.dashboardAccess}
+               WHERE user_id = ? AND dashboard_id = ?
+              UNION ALL
+              SELECT gda.access_level
+                FROM ${T.groupDashboardAccess} gda
+                JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
+                JOIN ${T.groups} g ON g.id = gda.group_id
+               WHERE gu.user_id = ? AND gda.dashboard_id = ? AND g.active AND g.company_id = ?
+            ) AS levels`,
+    [actor.companyId, dashboardId, actor.companyId, dashboardId,
+      actor.id, dashboardId, actor.id, dashboardId, actor.companyId]
+  );
+  if (!gate || !gate.available) return null;
 
   if (can(actor, 'access.grant')) return 'admin';
 
-  const { rows } = await db.query(
-    `SELECT access_level FROM ${T.dashboardAccess}
-      WHERE user_id = ? AND dashboard_id = ?
-     UNION ALL
-     SELECT gda.access_level
-       FROM ${T.groupDashboardAccess} gda
-       JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
-       JOIN ${T.groups} g ON g.id = gda.group_id
-      WHERE gu.user_id = ? AND gda.dashboard_id = ? AND g.active AND g.company_id = ?`,
-    [actor.id, dashboardId, actor.id, dashboardId, actor.companyId]
-  );
+  const rows = (gate.levels || []).map((level) => ({ access_level: level }));
 
-  const levels = rows.map((r) => r.access_level);
-  if (can(actor, 'dashboard.update')) levels.push('developer');
-  return strongestLevel(levels) || (can(actor, 'dashboard.update') ? 'developer' : null);
+  /*
+   * The level is the strongest GRANT, and nothing else.
+   *
+   * This used to add 'developer' for anybody whose role holds
+   * dashboard.update - which every USER does - so a "Can view" grant resolved
+   * to "Can edit", and a user with no grant at all could open every dashboard
+   * assigned to their company. The role says what KIND of thing somebody may
+   * do; the grant says what they may do with THIS dashboard. Both have to agree.
+   */
+  return strongestLevel(rows.map((r) => r.access_level));
+}
+
+/** The level one user holds on a dashboard directly (not through a group), or null. */
+async function directUserLevel(userId, dashboardId) {
+  const { rows } = await db.query(
+    `SELECT access_level FROM ${T.dashboardAccess} WHERE user_id = ? AND dashboard_id = ?`,
+    [userId, dashboardId]
+  );
+  return rows[0] ? rows[0].access_level : null;
 }
 
 /** Asserts the actor holds at least `required` on a dashboard. */
@@ -200,27 +251,35 @@ async function assertDashboardLevel(actor, dashboardId, required) {
 async function listAccessibleDashboards(actor) {
   if (actor.isPlatform) {
     const all = await registry.listDashboards();
-    return all.map((d) => ({ ...d, accessLevel: 'admin' }));
+    return all.map((d) => dashboardSummary(d, { accessLevel: 'admin' }));
   }
 
-  const assigned = await companyDashboardIds(actor.companyId);
-  const all = await registry.listDashboards(actor.companyId);
+  const grantsAll = can(actor, 'access.grant');
+
+  // Independent reads, so they run concurrently: one round trip of latency
+  // instead of three.
+  const [assigned, all, grantRows] = await Promise.all([
+    companyDashboardIds(actor.companyId),
+    registry.listDashboards(actor.companyId),
+    grantsAll
+      ? Promise.resolve({ rows: [] })
+      : db.query(
+          `SELECT dashboard_id, access_level FROM ${T.dashboardAccess} WHERE user_id = ?
+           UNION ALL
+           SELECT gda.dashboard_id, gda.access_level
+             FROM ${T.groupDashboardAccess} gda
+             JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
+             JOIN ${T.groups} g ON g.id = gda.group_id
+            WHERE gu.user_id = ? AND g.active AND g.company_id = ?`,
+          [actor.id, actor.id, actor.companyId]
+        ),
+  ]);
   const visible = all.filter((d) => assigned.has(d.id));
 
-  if (can(actor, 'access.grant')) {
-    return visible.map((d) => ({ ...d, accessLevel: 'admin' }));
+  if (grantsAll) {
+    return visible.map((d) => dashboardSummary(d, { accessLevel: 'admin' }));
   }
-
-  const { rows } = await db.query(
-    `SELECT dashboard_id, access_level FROM ${T.dashboardAccess} WHERE user_id = ?
-     UNION ALL
-     SELECT gda.dashboard_id, gda.access_level
-       FROM ${T.groupDashboardAccess} gda
-       JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
-       JOIN ${T.groups} g ON g.id = gda.group_id
-      WHERE gu.user_id = ? AND g.active AND g.company_id = ?`,
-    [actor.id, actor.id, actor.companyId]
-  );
+  const { rows } = grantRows;
 
   const byDashboard = new Map();
   for (const row of rows) {
@@ -230,64 +289,98 @@ async function listAccessibleDashboards(actor) {
     );
   }
 
-  const canUpdate = can(actor, 'dashboard.update');
-
+  // Only what was granted, at the level it was granted - see getAccessLevel.
   return visible
-    .filter((d) => byDashboard.has(d.id) || canUpdate)
-    .map((d) => {
-      const explicitLevel = byDashboard.get(d.id);
-      const effectiveLevel = canUpdate
-        ? strongestLevel([explicitLevel, 'developer'].filter(Boolean))
-        : explicitLevel;
-      return { ...d, accessLevel: effectiveLevel || 'view' };
-    });
+    .filter((d) => byDashboard.has(d.id))
+    .map((d) => dashboardSummary(d, { accessLevel: byDashboard.get(d.id) }));
+}
+
+/**
+ * How many dashboards the actor may open - the number an overview shows -
+ * counted in SQL instead of building the list. Same rules as
+ * listAccessibleDashboards.
+ */
+async function countAccessibleDashboards(actor) {
+  if (actor.isPlatform) return registry.countDashboards();
+  if (can(actor, 'access.grant')) {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM (${COMPANY_DASHBOARD_IDS_SQL}) avail`,
+      [actor.companyId, actor.companyId]
+    );
+    return rows[0].n;
+  }
+  const { rows } = await db.query(
+    `SELECT COUNT(*)::int AS n
+       FROM (${COMPANY_DASHBOARD_IDS_SQL}) avail
+       JOIN (
+         SELECT dashboard_id FROM ${T.dashboardAccess} WHERE user_id = ?
+         UNION
+         SELECT gda.dashboard_id
+           FROM ${T.groupDashboardAccess} gda
+           JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
+           JOIN ${T.groups} g ON g.id = gda.group_id
+          WHERE gu.user_id = ? AND g.active AND g.company_id = ?
+       ) granted ON granted.dashboard_id = avail.dashboard_id`,
+    [actor.companyId, actor.companyId, actor.id, actor.id, actor.companyId]
+  );
+  return rows[0].n;
 }
 
 /** Every grant reaching one user, direct and inherited, labelled by origin. */
 async function listUserGrants(userId) {
-  const { rows: direct } = await db.query(
-    `SELECT dashboard_id AS "dashboardId", access_level AS level, 'direct' AS origin,
-            NULL::int AS "groupId", NULL::text AS "groupName"
-       FROM ${T.dashboardAccess} WHERE user_id = ?`,
-    [userId]
-  );
-  const { rows: inherited } = await db.query(
-    `SELECT gda.dashboard_id AS "dashboardId", gda.access_level AS level, 'group' AS origin,
-            g.id AS "groupId", g.name AS "groupName"
-       FROM ${T.groupDashboardAccess} gda
-       JOIN ${T.groups} g ON g.id = gda.group_id
-       JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
-       WHERE gu.user_id = ? AND g.active`,
-    [userId]
-  );
-
-  const all = await registry.listDashboards();
-  const titles = new Map(all.map((d) => [d.id, d.title]));
-  return [...direct, ...inherited]
-    .map((row) => ({ ...row, dashboardTitle: titles.get(row.dashboardId) || null }))
-    .sort((a, b) => a.dashboardId.localeCompare(b.dashboardId));
+  // Direct and inherited in one statement, ordered by the database; titles come
+  // from the registry, read concurrently. Only a group grant carries its group,
+  // so a direct one omits groupId/groupName rather than sending nulls.
+  const [{ rows }, titles] = await Promise.all([
+    db.query(
+      `SELECT dashboard_id AS "dashboardId", access_level AS level, 'direct' AS origin,
+              NULL::int AS "groupId", NULL::text AS "groupName"
+         FROM ${T.dashboardAccess} WHERE user_id = ?
+       UNION ALL
+       SELECT gda.dashboard_id, gda.access_level, 'group', g.id, g.name
+         FROM ${T.groupDashboardAccess} gda
+         JOIN ${T.groups} g ON g.id = gda.group_id
+         JOIN ${T.groupUsers} gu ON gu.group_id = gda.group_id
+        WHERE gu.user_id = ? AND g.active
+        ORDER BY 1`,
+      [userId, userId]
+    ),
+    registry.dashboardTitles(),
+  ]);
+  return rows.map((row) => {
+    const grant = {
+      dashboardId: row.dashboardId,
+      dashboardTitle: titles.get(row.dashboardId) || null,
+      level: row.level,
+      origin: row.origin,
+    };
+    if (row.origin === 'group') Object.assign(grant, { groupId: row.groupId, groupName: row.groupName });
+    return grant;
+  });
 }
 
 /** Everyone in `companyId` who holds a grant on a dashboard, users and groups. */
 async function listDashboardGrants(companyId, dashboardId) {
-  const { rows: users } = await db.query(
-    `SELECT a.user_id AS "userId", u.username, u.email, a.access_level AS level,
-            a.granted_at AS "grantedAt"
-       FROM ${T.dashboardAccess} a
-       JOIN ${T.users} u ON u.id = a.user_id
-      WHERE a.dashboard_id = ? AND u.company_id = ?
-      ORDER BY u.username`,
-    [dashboardId, companyId]
-  );
-  const { rows: groups } = await db.query(
-    `SELECT gda.group_id AS "groupId", g.name AS "groupName", gda.access_level AS level,
-            gda.granted_at AS "grantedAt", g.active
-       FROM ${T.groupDashboardAccess} gda
-       JOIN ${T.groups} g ON g.id = gda.group_id
-      WHERE gda.dashboard_id = ? AND g.company_id = ?
-      ORDER BY g.name`,
-    [dashboardId, companyId]
-  );
+  // grantedAt is not selected: no screen shows when a grant was made.
+  const [{ rows: users }, { rows: groups }] = await Promise.all([
+    db.query(
+      `SELECT a.user_id AS "userId", u.username, u.email, a.access_level AS level
+         FROM ${T.dashboardAccess} a
+         JOIN ${T.users} u ON u.id = a.user_id
+        WHERE a.dashboard_id = ? AND u.company_id = ?
+        ORDER BY u.username`,
+      [dashboardId, companyId]
+    ),
+    db.query(
+      `SELECT gda.group_id AS "groupId", g.name AS "groupName", gda.access_level AS level,
+              g.active
+         FROM ${T.groupDashboardAccess} gda
+         JOIN ${T.groups} g ON g.id = gda.group_id
+        WHERE gda.dashboard_id = ? AND g.company_id = ?
+        ORDER BY g.name`,
+      [dashboardId, companyId]
+    ),
+  ]);
   return {
     dashboardId,
     users,
@@ -334,6 +427,7 @@ async function revokeGroupAccess(groupId, dashboardId) {
 }
 
 module.exports = {
+  directUserLevel,
   isValidLevel,
   requireLevel,
   requireDashboardId,
@@ -346,6 +440,9 @@ module.exports = {
   getAccessLevel,
   assertDashboardLevel,
   listAccessibleDashboards,
+  countAccessibleDashboards,
+  isDashboardAvailable,
+  dashboardSummary,
   listUserGrants,
   listDashboardGrants,
   grantUserAccess,

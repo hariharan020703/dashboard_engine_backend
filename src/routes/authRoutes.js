@@ -4,6 +4,7 @@ const { ok, fail, requireString } = require('../api/response');
 const {
   findUserByIdentifier,
   findUserById,
+  findCredentialsById,
   publicUser,
   getRolePermissions,
   passwordProblem,
@@ -22,7 +23,6 @@ const {
 } = require('../auth/tokenService');
 const { resolveActivationToken, consumeActivationToken } = require('../auth/activationService');
 const throttle = require('../auth/loginThrottle');
-const { getUserScopes, ENFORCED: SCOPES_ENFORCED } = require('../auth/scopeService');
 const { listAccessibleDashboards } = require('../auth/accessService');
 const { audit, EVENTS } = require('../auth/auditService');
 const { requireRbac, requireAuth } = require('../middleware/auth');
@@ -53,26 +53,30 @@ router.use(requireRbac);
 /**
  * The payload every path that establishes a session returns.
  *
- * The refresh token is not in it - it went out as an HttpOnly cookie and must
- * never be readable by script. What the client gets is the short-lived access
- * token, which it holds in memory.
+ * No token is in it - not the access token, not the refresh token, not the
+ * CSRF value. All three went out as cookies (session.js), and the two that
+ * authenticate are HttpOnly, so no script on the page can ever read them. What
+ * the body carries is only what the UI renders: who signed in and what they
+ * may do.
  */
-async function sessionPayload(user, accessToken, csrfToken) {
+async function sessionPayload(user) {
   const permissions = await getRolePermissions(user.role);
   return {
-    accessToken,
     expiresIn: ACCESS_TOKEN_TTL_SECONDS,
-    csrfToken,
     user: { ...publicUser(user), permissions },
   };
 }
 
+/** Mints both tokens for a refresh family and writes them as cookies. */
+function writeSession(res, user, refresh) {
+  const accessToken = issueAccessToken(user, refresh.familyId);
+  setSessionCookies(res, { accessToken, refreshToken: refresh.token });
+}
+
 /** Starts a brand new refresh family and writes the cookies. */
 async function startSession(res, user) {
-  const refresh = await issueRefreshToken(user.id);
-  const csrfToken = setSessionCookies(res, refresh.token);
-  const accessToken = issueAccessToken(user, refresh.familyId);
-  return sessionPayload(user, accessToken, csrfToken);
+  writeSession(res, user, await issueRefreshToken(user.id));
+  return sessionPayload(user);
 }
 
 /* ------------------------------------------------------------------ login --- */
@@ -143,8 +147,8 @@ router.post('/login', async (req, res) => {
 /*
  * POST /api/auth/refresh - rotate the refresh token and mint a new access token.
  *
- * The only endpoint besides logout that authenticates from the cookie, so it is
- * also the only one that needs the CSRF check.
+ * Authenticates from the refresh cookie rather than through requireAuth, so it
+ * carries its own CSRF check (as does logout).
  */
 router.post('/refresh', requireCsrf, async (req, res) => {
   const presented = readRefreshCookie(req);
@@ -174,10 +178,9 @@ router.post('/refresh', requireCsrf, async (req, res) => {
   }
 
   const rotated = await issueRefreshToken(user.id, { familyId: row.family_id, replaces: row.id });
-  const csrfToken = setSessionCookies(res, rotated.token);
-  const accessToken = issueAccessToken(user, rotated.familyId);
+  writeSession(res, user, rotated);
 
-  const payload = await sessionPayload(user, accessToken, csrfToken);
+  const payload = await sessionPayload(user);
   ok(res, { ...payload, state: user.must_change_password ? 'PASSWORD_CHANGE_REQUIRED' : 'AUTHENTICATED' });
 });
 
@@ -213,14 +216,14 @@ router.post('/logout', requireCsrf, async (req, res) => {
 // GET /api/auth/me - the signed-in account, its permissions and what it may open
 router.get('/me', requireAuth, async (req, res) => {
   const actor = req.actor;
-  const user = await findUserById(actor.id);
   const dashboards = actor.mustChangePassword ? [] : await listAccessibleDashboards(actor);
 
   ok(res, {
     state: actor.mustChangePassword ? 'PASSWORD_CHANGE_REQUIRED' : 'AUTHENTICATED',
-    user: { ...publicUser(user), permissions: actor.permissions },
-    scopes: actor.scopes,
-    scopesEnforced: SCOPES_ENFORCED,
+    user: { ...req.account, permissions: actor.permissions },
+    // Data scopes are not sent: no screen reads them from here (the person
+    // screen reads a user's scopes from /users/:id/scope), and they are not
+    // enforced yet.
     dashboards,
   });
 });
@@ -242,8 +245,9 @@ router.get('/sessions', requireAuth, async (req, res) => {
 router.post('/change-password', requireAuth, async (req, res) => {
   const { currentPassword, newPassword } = req.body || {};
   const user = await findUserById(req.actor.id);
+  const credentials = await findCredentialsById(req.actor.id);
 
-  if (!verifyPassword(currentPassword, user.password_hash)) {
+  if (!verifyPassword(currentPassword, credentials && credentials.password_hash)) {
     throw fail('INVALID_CREDENTIALS', 'Your current password is incorrect.');
   }
   const problem = passwordProblem(newPassword);

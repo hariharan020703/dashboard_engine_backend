@@ -167,6 +167,19 @@ async function revokeAllForUser(userId, reason, conn) {
   return result.rowCount;
 }
 
+/** Every live session of every account in a company, in one statement. */
+async function revokeAllForCompany(companyId, reason, conn) {
+  const client = conn || db;
+  const result = await client.query(
+    `UPDATE ${T.refreshTokens}
+        SET revoked_at = now(), revoked_reason = ?
+      WHERE revoked_at IS NULL
+        AND user_id IN (SELECT id FROM ${T.users} WHERE company_id = ?)`,
+    [reason, companyId]
+  );
+  return result.rowCount;
+}
+
 /**
  * Validates a presented refresh token and returns its row.
  *
@@ -235,8 +248,8 @@ async function pruneExpiredTokens() {
 /** Live sessions for one account, for the profile screen. No secrets included. */
 async function listSessions(userId) {
   const { rows } = await db.query(
-    `SELECT family_id AS "familyId", MIN(issued_at) AS "startedAt",
-            MAX(issued_at) AS "lastUsedAt", MAX(expires_at) AS "expiresAt"
+    // What the sessions list shows: which session, and when it was last used.
+    `SELECT family_id AS "familyId", MAX(issued_at) AS "lastUsedAt"
        FROM ${T.refreshTokens}
       WHERE user_id = ? AND revoked_at IS NULL AND expires_at > now()
       GROUP BY family_id
@@ -255,6 +268,7 @@ module.exports = {
   consumeRefreshToken,
   revokeFamily,
   revokeAllForUser,
+  revokeAllForCompany,
   pruneExpiredTokens,
   listSessions,
 };

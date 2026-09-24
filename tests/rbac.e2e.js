@@ -65,12 +65,11 @@ function section(title) {
   console.log(`\n=== ${title} ===`);
 }
 
-/** A browser-ish client: keeps cookies, holds an access token in memory. */
+/** A browser-ish client: keeps cookies - the whole session lives in them. */
 function client(label) {
   return {
     label,
     cookies: new Map(),
-    accessToken: null,
     csrfToken: null,
     cookieHeader() {
       return [...this.cookies.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
@@ -90,8 +89,7 @@ function client(label) {
     async call(method, url, body, opts = {}) {
       const headers = {};
       if (body !== undefined) headers['Content-Type'] = 'application/json';
-      if (this.accessToken && !opts.noAuth) headers.Authorization = `Bearer ${this.accessToken}`;
-      if (this.cookies.size) headers.Cookie = this.cookieHeader();
+      if (this.cookies.size && !opts.noAuth) headers.Cookie = this.cookieHeader();
       if (this.csrfToken && !opts.noCsrf) headers['X-CSRF-Token'] = this.csrfToken;
       if (opts.csrf) headers['X-CSRF-Token'] = opts.csrf;
 
@@ -106,10 +104,9 @@ function client(label) {
       if (text) { try { json = JSON.parse(text); } catch { json = null; } }
       return { status: res.status, body: json };
     },
-    adopt(payload) {
-      if (payload && payload.accessToken) this.accessToken = payload.accessToken;
-      if (payload && payload.csrfToken) this.csrfToken = payload.csrfToken;
-    },
+    // Kept so every sign-in step still reads as one; the session itself was
+    // already absorbed from Set-Cookie, and the body carries no token to keep.
+    adopt() {},
   };
 }
 
@@ -153,8 +150,9 @@ function activationTokenFrom(email) {
   });
   check('login succeeds', r.status === 200, JSON.stringify(r.body));
   check('state is PASSWORD_CHANGE_REQUIRED', r.body?.data?.state === 'PASSWORD_CHANGE_REQUIRED');
-  check('response carries no refresh token', !JSON.stringify(r.body).includes('da_refresh'));
-  check('refresh cookie was set HttpOnly', owner.cookies.has('da_refresh'));
+  check('response carries no token of any kind', !/token/i.test(Object.keys(r.body?.data || {}).join(',')), JSON.stringify(Object.keys(r.body?.data || {})));
+  check('refresh cookie was set', owner.cookies.has('da_refresh'));
+  check('access cookie was set', owner.cookies.has('da_access'));
   owner.adopt(r.body.data);
 
   r = await owner.call('GET', '/api/platform/companies');
@@ -208,7 +206,7 @@ function activationTokenFrom(email) {
   check('duplicate administrator is refused', r.status === 409 && r.body?.error?.code === 'CONFLICT', JSON.stringify(r.body));
 
   r = await owner.call('GET', '/api/platform/companies');
-  check('the rejected company was not created', !(r.body?.data || []).some((c) => c.name === 'Rollback Test Ltd'), JSON.stringify(r.body));
+  check('the rejected company was not created', !(r.body?.data?.items || []).some((c) => c.name === 'Rollback Test Ltd'), JSON.stringify(r.body));
 
   r = await owner.call('PUT', `/api/platform/companies/${companyA}/dashboards/default`);
   check('assigns the dashboard to company A', r.status === 200, JSON.stringify(r.body));
@@ -245,8 +243,23 @@ function activationTokenFrom(email) {
   /* ------------------------------------------------------------------ */
   section('Company administrator: scoped to their own company');
 
-  r = await alphaAdmin.call('GET', '/api/users');
-  check('sees only their company', r.status === 200 && r.body.data.every((u) => u.companyId === companyA), JSON.stringify(r.body?.data?.map((u) => u.username)));
+  r = await alphaAdmin.call('GET', '/api/users?pageSize=100');
+  // The list item carries no company for a company caller (it is one company
+  // by definition), so isolation is asserted by who is in it: nobody from B.
+  const alphaDirectory = r.body?.data?.items || [];
+  check('sees only their company', r.status === 200 && alphaDirectory.length > 0 && !alphaDirectory.some((u) => u.username.startsWith('beta.')) && !alphaDirectory.some((u) => 'companyName' in u), JSON.stringify(alphaDirectory.map((u) => u.username)));
+
+  r = await alphaAdmin.call('GET', `/api/users?companyId=${companyB}&pageSize=100`);
+  check('companyId cannot widen a company caller', r.status === 200 && !(r.body?.data?.items || []).some((u) => u.username.startsWith('beta.')), JSON.stringify(r.body?.data));
+
+  r = await alphaAdmin.call('GET', '/api/users?search=beta');
+  check('search stays inside the company', r.status === 200 && r.body?.data?.total === 0, JSON.stringify(r.body?.data));
+
+  r = await alphaAdmin.call('GET', '/api/users?sort=password_hash');
+  check('an unknown sort key is refused', r.status === 400 && r.body?.error?.code === 'VALIDATION_ERROR', JSON.stringify(r.body));
+
+  r = await alphaAdmin.call('GET', '/api/users?pageSize=1');
+  check('a page holds pageSize rows and the total counts all', r.status === 200 && r.body?.data?.items?.length === 1 && r.body?.data?.total === alphaDirectory.length, JSON.stringify(r.body?.data));
 
   // The tenant namespace answers about the caller's own company, and takes no
   // company id at all - so there is nothing here to point at another tenant.
@@ -254,7 +267,7 @@ function activationTokenFrom(email) {
   check('reads their own company', r.status === 200 && r.body.data?.id === companyA, JSON.stringify(r.body));
 
   r = await alphaAdmin.call('GET', '/api/workspace/overview');
-  check('own-company counts are scoped to them', r.status === 200 && r.body.data?.company?.id === companyA, JSON.stringify(r.body));
+  check('own-company counts are scoped to them', r.status === 200 && r.body.data?.users === alphaDirectory.length, JSON.stringify(r.body));
 
   // The whole platform namespace is refused on role scope, before any
   // permission is consulted.
@@ -287,8 +300,8 @@ function activationTokenFrom(email) {
   check('cannot create a SUPER_ADMIN', r.status === 403 && r.body?.error?.code === 'INSUFFICIENT_PERMISSION', JSON.stringify(r.body));
 
   // Find company B's admin id by asking as the owner, then try to reach it.
-  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}`);
-  const betaAdminId = r.body.data.find((u) => u.username === 'beta.admin').id;
+  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}&search=beta.admin`);
+  const betaAdminId = r.body.data.items.find((u) => u.username === 'beta.admin').id;
 
   r = await alphaAdmin.call('GET', `/api/users/${betaAdminId}`);
   check('another company\u2019s user is a 404, not a 403', r.status === 404 && r.body?.error?.code === 'RESOURCE_NOT_FOUND', JSON.stringify(r.body));
@@ -299,8 +312,8 @@ function activationTokenFrom(email) {
   r = await alphaAdmin.call('DELETE', `/api/users/${betaAdminId}`);
   check('cannot delete another company\u2019s user', r.status === 404);
 
-  r = await owner.call('GET', '/api/platform/users');
-  const ownerId = r.body.data.find((u) => u.role === 'SUPER_ADMIN').id;
+  r = await owner.call('GET', '/api/platform/users?role=SUPER_ADMIN');
+  const ownerId = r.body.data.items.find((u) => u.role === 'SUPER_ADMIN').id;
   r = await alphaAdmin.call('PATCH', `/api/users/${ownerId}`, { role: 'USER' });
   check('cannot manage the platform owner', r.status === 404 || r.status === 403, `${r.status} ${JSON.stringify(r.body)}`);
 
@@ -382,8 +395,8 @@ function activationTokenFrom(email) {
   check('their own user can be added as a member', r.status === 200, JSON.stringify(r.body));
 
   // The guard that stops group membership breaching the tenant boundary.
-  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}`);
-  const betaUserId = r.body.data.find((u) => u.username === 'beta.admin').id;
+  r = await owner.call('GET', `/api/platform/users?companyId=${companyB}&search=beta.admin`);
+  const betaUserId = r.body.data.items.find((u) => u.username === 'beta.admin').id;
   r = await alphaAdmin.call('PUT', `/api/groups/${groupId}`, { userIds: [betaUserId] });
   check(
     'a member from another company is refused',
@@ -450,10 +463,11 @@ function activationTokenFrom(email) {
   /* ------------------------------------------------------------------ */
   section('Token lifecycle');
 
-  const before = alphaUser.accessToken;
+  const before = alphaUser.cookies.get('da_access');
   const beforeCookie = alphaUser.cookies.get('da_refresh');
   r = await alphaUser.call('POST', '/api/auth/refresh');
-  check('refresh returns a new access token', r.status === 200 && r.body?.data?.accessToken !== before, JSON.stringify(r.body?.error));
+  check('refresh sets a new access cookie', r.status === 200 && alphaUser.cookies.get('da_access') !== before, JSON.stringify(r.body?.error));
+  check('refresh response carries no token', !/token/i.test(Object.keys(r.body?.data || {}).join(',')));
   check('refresh rotates the refresh cookie', alphaUser.cookies.get('da_refresh') !== beforeCookie);
   alphaUser.adopt(r.body.data);
 
@@ -481,9 +495,19 @@ function activationTokenFrom(email) {
   })();
   check('refresh without the CSRF header is refused', noCsrf.status === 403 && noCsrf.body?.error?.code === 'CSRF_TOKEN_INVALID', JSON.stringify(noCsrf.body));
 
+  // The access cookie is sent ambiently too, so every state-changing call -
+  // not only refresh/logout - must refuse a request without the header.
+  const forged = await (async () => {
+    const headers = { Cookie: alphaUser.cookieHeader(), 'Content-Type': 'application/json' };
+    const res = await fetch(BASE + '/api/auth/change-password', { method: 'POST', headers, body: '{}' });
+    return { status: res.status, body: await res.json().catch(() => null) };
+  })();
+  check('a state-changing call without the CSRF header is refused', forged.status === 403 && forged.body?.error?.code === 'CSRF_TOKEN_INVALID', JSON.stringify(forged.body));
+
   r = await alphaUser.call('POST', '/api/auth/logout');
   check('logout succeeds', r.status === 200);
   check('logout clears the refresh cookie', !alphaUser.cookies.has('da_refresh'));
+  check('logout clears the access cookie', !alphaUser.cookies.has('da_access'));
 
   const stale = client('stale');
   stale.cookies.set('da_refresh', beforeCookie);

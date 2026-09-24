@@ -1,6 +1,7 @@
 const { db, T } = require('../config/database');
 const { UNIQUE_VIOLATION } = require('../config/pgPool');
 const { fail, requireString } = require('../api/response');
+const { likePattern, orderBy, pagedRows } = require('../api/listQuery');
 
 /**
  * Companies: the tenant boundary every other table hangs off.
@@ -35,42 +36,122 @@ function shapeCompany(row) {
     createdAt: row.created_at || null,
     userCount: row.userCount === undefined ? undefined : Number(row.userCount),
     dashboardCount: row.dashboardCount === undefined ? undefined : Number(row.dashboardCount),
+    pendingCount: row.pendingCount === undefined ? undefined : Number(row.pendingCount),
   };
 }
 
-const LIST_SQL = `
-  SELECT c.id, c.name, c.slug, c.active, c.created_at,
-         (SELECT COUNT(*) FROM ${T.users} u WHERE u.company_id = c.id) AS "userCount",
-         (SELECT COUNT(*) FROM ${T.companyDashboards} cd WHERE cd.company_id = c.id) AS "dashboardCount"
-    FROM ${T.companies} c`;
+/*
+ * Counts are joined as pre-aggregated subqueries rather than correlated per
+ * row, so sorting a page by "users" or "dashboards" is one pass over each table
+ * instead of two subqueries for every company.
+ */
+const COUNTED_FROM = `
+    FROM ${T.companies} c
+    LEFT JOIN (SELECT company_id, COUNT(*) AS n,
+                      COUNT(*) FILTER (WHERE status = 'pending') AS pending
+                 FROM ${T.users} GROUP BY company_id) uc ON uc.company_id = c.id
+    LEFT JOIN (SELECT company_id, COUNT(*) AS n
+                 FROM ${T.companyDashboards} GROUP BY company_id) dc ON dc.company_id = c.id`;
+
+const COUNTED_COLUMNS = `c.id, c.name, c.slug, c.active, c.created_at,
+         COALESCE(uc.n, 0) AS "userCount", COALESCE(dc.n, 0) AS "dashboardCount"`;
+
+/** Sort keys the companies table offers. */
+const COMPANY_SORTS = {
+  name: 'lower(c.name)',
+  status: 'c.active',
+  users: 'COALESCE(uc.n, 0)',
+  dashboards: 'COALESCE(dc.n, 0)',
+  created: 'c.created_at',
+};
 
 /**
- * Every company, or just the one the caller belongs to.
+ * One page of companies, searched on name and slug, sorted in SQL.
  *
- * A company-scoped administrator legitimately needs to read their own company -
- * its name and status appear all over their screens - so this takes the actor
- * rather than being platform-only, and narrows the query instead of refusing.
+ * A company-scoped caller is narrowed to their own company rather than
+ * refused - their company's name and status appear all over their screens.
  */
-async function listCompanies(actor) {
-  if (actor.isPlatform) {
-    const { rows } = await db.query(`${LIST_SQL} ORDER BY c.name`);
-    return rows.map(shapeCompany);
+async function listCompanies(actor, list, { active } = {}) {
+  const where = [];
+  const params = [];
+  if (!actor.isPlatform) {
+    where.push('c.id = ?');
+    params.push(actor.companyId);
   }
-  const { rows } = await db.query(`${LIST_SQL} WHERE c.id = ?`, [actor.companyId]);
-  return rows.map(shapeCompany);
+  if (active === 'true' || active === 'false') {
+    where.push('c.active = ?');
+    params.push(active === 'true');
+  } else if (active !== undefined && active !== '') {
+    throw fail('VALIDATION_ERROR', 'active must be true or false.');
+  }
+  if (list.search) {
+    where.push('(c.name ILIKE ? OR c.slug ILIKE ?)');
+    const pattern = likePattern(list.search);
+    params.push(pattern, pattern);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+  return pagedRows(
+    db,
+    `SELECT ${COUNTED_COLUMNS}, COUNT(*) OVER () AS "__total"
+       ${COUNTED_FROM}
+      ${whereSql}
+      ${orderBy(list, COMPANY_SORTS, 'c.id')}
+      LIMIT ? OFFSET ?`,
+    [...params, list.pageSize, list.offset],
+    `SELECT COUNT(*) AS n FROM ${T.companies} c ${whereSql}`,
+    params,
+    shapeCompany
+  );
 }
 
+/**
+ * id, name and active for every company the caller may see - what a picker
+ * (tenant switcher, company filter, "which company" field) renders. No counts
+ * and no dates: those belong to the companies table, not to a dropdown.
+ */
+async function listCompanyOptions(actor) {
+  const scope = actor.isPlatform
+    ? { sql: '', params: [] }
+    : { sql: 'WHERE id = ?', params: [actor.companyId] };
+  const { rows } = await db.query(
+    `SELECT id, name, active FROM ${T.companies} ${scope.sql} ORDER BY lower(name), id`,
+    scope.params
+  );
+  return rows.map((r) => ({ id: r.id, name: r.name, active: Boolean(r.active) }));
+}
+
+/** One company with the counts its detail screen shows. */
 async function findCompanyById(id) {
-  const { rows } = await db.query(`${LIST_SQL} WHERE c.id = ?`, [id]);
+  const { rows } = await db.query(
+    `SELECT ${COUNTED_COLUMNS}, COALESCE(uc.pending, 0) AS "pendingCount"
+       ${COUNTED_FROM}
+      WHERE c.id = ?`,
+    [id]
+  );
   return shapeCompany(rows[0]);
 }
 
-/** The company, or a 404. Company-scoped callers may only ask about their own. */
-async function requireCompany(actor, id) {
+/** Just the company row - what a guard needs to know it exists and is active. */
+async function findCompanyRow(id) {
+  const { rows } = await db.query(
+    `SELECT id, name, slug, active, created_at FROM ${T.companies} WHERE id = ?`,
+    [id]
+  );
+  return shapeCompany(rows[0]);
+}
+
+/**
+ * The company, or a 404. Company-scoped callers may only ask about their own.
+ *
+ * Most callers are guards that need only existence, name and status, so the
+ * counts are opt-in ({ counts: true }) for the screens that display them.
+ */
+async function requireCompany(actor, id, { counts = false } = {}) {
   if (!actor.isPlatform && id !== actor.companyId) {
     throw fail('TENANT_ACCESS_DENIED', 'That company is not yours to view.');
   }
-  const company = await findCompanyById(id);
+  const company = counts ? await findCompanyById(id) : await findCompanyRow(id);
   if (!company) throw fail('RESOURCE_NOT_FOUND', 'Company not found');
   return company;
 }
@@ -184,6 +265,8 @@ module.exports = {
   slugify,
   shapeCompany,
   listCompanies,
+  listCompanyOptions,
+  COMPANY_SORTS,
   findCompanyById,
   requireCompany,
   insertCompany,

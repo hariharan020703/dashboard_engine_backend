@@ -248,8 +248,11 @@ text, validated against the registry on write and joined against it on read.
 
 | | Lifetime | Where it lives | Revocable |
 |---|---|---|---|
-| **Access token** | `ACCESS_TOKEN_EXPIRY` (15m) | memory, sent as `Authorization: Bearer` | no — it expires |
-| **Refresh token** | `REFRESH_TOKEN_EXPIRY` (30d) | HttpOnly cookie, `Path=/api/auth` | yes — it is a row |
+| **Access token** | `ACCESS_TOKEN_EXPIRY` (15m) | HttpOnly cookie `da_access`, `Path=/api` | no — it expires |
+| **Refresh token** | `REFRESH_TOKEN_EXPIRY` (30d) | HttpOnly cookie `da_refresh`, `Path=/api/auth` | yes — it is a row |
+
+No token is ever in a response body: login, refresh, activation and password change return
+only the user, its permissions and the auth state. Both tokens are cookies no script can read.
 
 Access-token claims carry identity only. Role, permissions, company status and scopes are
 re-read on every request, so deactivating a user or changing their role takes effect on
@@ -263,10 +266,26 @@ change, role change, deactivation, access reissue and company deactivation.
 Only the HMAC of a refresh token is stored, keyed with `JWT_REFRESH_SECRET`, so a dump of
 `refresh_tokens` cannot be replayed without a secret that lives outside the database.
 
-`/api/auth/refresh` and `/api/auth/logout` are the only cookie-authenticated endpoints, so
-they are the only ones needing CSRF protection: `SameSite=Strict`, a path-scoped cookie, and
-a double-submit header checked in `src/middleware/session.js`. Everything else authenticates
-with a bearer token, which is never sent ambiently.
+Every endpoint is cookie-authenticated, so every state-changing request needs CSRF
+protection: `SameSite=Strict` plus a double-submit header (`X-CSRF-Token` matching the
+readable `da_csrf` cookie), checked in `src/middleware/session.js`. `requireAuth` applies it
+to every non-GET/HEAD/OPTIONS request; refresh and logout, which authenticate from the
+refresh cookie instead, apply it directly. There is no `Authorization: Bearer` path.
+
+### Lists are paged by the server
+
+Every list that grows with the business — `GET /api/users` (and `/api/platform/users`),
+`GET /api/platform/companies`, `GET /api/platform/audit`, and the context layer's review queue,
+glossary and fact list — takes `?page&pageSize&search&sort&dir` plus its own filters and answers
+`{ items, total }` (`src/api/listQuery.js`). The database filters, orders and limits; `total`
+comes from `COUNT(*) OVER ()` in the same statement, so paging costs no extra round trip. `sort`
+is a key from the endpoint's own whitelist, never SQL; an unknown key is a 400. Company scoping is
+applied in SQL exactly as before — a company caller's `companyId` parameter is still ignored.
+
+Pickers do not page: `GET /api/platform/companies/options` is `[{ id, name, active }]`.
+
+Every response carries a `Server-Timing` header (`app` = time in the API, `ser` = JSON
+serialisation), visible per request in the browser's Network panel.
 
 ### Authentication states
 

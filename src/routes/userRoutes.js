@@ -1,4 +1,5 @@
 const express = require('express');
+const { parseListQuery } = require('../api/listQuery');
 const { ok, fail, requireId } = require('../api/response');
 const { T, withTransaction } = require('../config/database');
 const users = require('../auth/userService');
@@ -87,9 +88,16 @@ router.get('/scope-options', requirePermission('scope.read'), async (req, res) =
   ok(res, { enforced: SCOPES_ENFORCED, dimensions: await scopeOptions() });
 });
 
-// GET /api/users - the user directory the caller may see
+// GET /api/users - one page of the user directory the caller may see.
+// ?page&pageSize&search&sort=name|company|role|status|lastLogin&dir&role&status
+// (+ &companyId for a platform caller) -> { items, total }
 router.get('/', requirePermission('user.read'), async (req, res) => {
-  ok(res, await users.listUsers(req.actor, { companyId: req.query.companyId }));
+  const list = parseListQuery(req.query, users.USER_SORTS, { sort: 'name', pageSize: 15 });
+  ok(res, await users.listUsers(req.actor, list, {
+    companyId: req.query.companyId,
+    role: req.query.role,
+    status: req.query.status,
+  }));
 });
 
 // POST /api/users - onboard an account and send its activation email
@@ -221,7 +229,7 @@ router.post('/:id/activate', requirePermission('user.activate'), async (req, res
   assertCanManageUser(req.actor, target);
 
   if (target.status === 'active') throw fail('CONFLICT', 'That account is already active.');
-  if (!target.password_hash) {
+  if (!target.has_password) {
     throw fail(
       'CONFLICT',
       'That account has never been activated. Send a new activation link instead.'

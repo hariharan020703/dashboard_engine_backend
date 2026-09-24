@@ -145,6 +145,35 @@ function defaultDashboardId() {
   return DEFAULT_DASHBOARD_ID;
 }
 
+/*
+ * Parsed titles of the dashboard files, keyed by path and remembered with the
+ * file's mtime. Every dashboard listing includes the disk templates, and
+ * re-reading and JSON-parsing every file for each listing was per-request work
+ * proportional to the size of the directory. A stat per file is kept so an
+ * edited or replaced file (these are runtime config) is still picked up.
+ */
+const diskTitleCache = new Map();
+
+function diskTitle(filePath) {
+  let mtimeMs;
+  try {
+    mtimeMs = fs.statSync(filePath).mtimeMs;
+  } catch (_) {
+    diskTitleCache.delete(filePath);
+    return undefined;
+  }
+  const cached = diskTitleCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.title;
+  let title;
+  try {
+    title = readSpecFile(filePath).title;
+  } catch (_) {
+    title = undefined;
+  }
+  diskTitleCache.set(filePath, { mtimeMs, title });
+  return title;
+}
+
 function listDiskDashboards() {
   const entries = [];
   const seen = new Set();
@@ -159,17 +188,37 @@ function listDiskDashboards() {
     if (!file.endsWith('.json')) continue;
     const id = path.basename(file, '.json');
     if (!DASHBOARD_ID_RE.test(id) || seen.has(id)) continue;
-    let title;
-    try {
-      title = readSpecFile(path.join(DASHBOARD_DIR, file)).title;
-    } catch (_) {
-      title = undefined;
-    }
     seen.add(id);
-    entries.push({ id, title, companyId: null, source: 'file' });
+    entries.push({ id, title: diskTitle(path.join(DASHBOARD_DIR, file)), companyId: null, source: 'file' });
   }
 
   return entries;
+}
+
+/**
+ * Whether an id names a dashboard - the same rule listDashboards() applies (a
+ * database row or a <id>.json file), answered for one id without listing them.
+ */
+async function dashboardExists(dashboardId) {
+  if (!DASHBOARD_ID_RE.test(String(dashboardId || ''))) return false;
+  try {
+    const { rows } = await db.query(`SELECT 1 FROM ${T.dashboards} WHERE id = ?`, [dashboardId]);
+    if (rows.length) return true;
+  } catch (_) {
+    // Database not ready: the disk registry still answers.
+  }
+  return fs.existsSync(registryPathFor(dashboardId));
+}
+
+/** id -> title for every known dashboard, for joining titles onto grant rows. */
+async function dashboardTitles() {
+  const all = await listDashboards();
+  return new Map(all.map((d) => [d.id, d.title]));
+}
+
+/** How many dashboards exist, as listDashboards() would count them. */
+async function countDashboards() {
+  return (await listDashboards()).length;
 }
 
 /**
@@ -281,6 +330,9 @@ module.exports = {
   resolveDefaultSpec,
   defaultDashboardId,
   listDashboards,
+  dashboardExists,
+  dashboardTitles,
+  countDashboards,
   saveSpec,
   deleteDashboard,
   invalidateSpecCache,

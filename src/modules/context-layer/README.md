@@ -74,6 +74,7 @@ feature does not collide with anything else:
 | `POST` | `/api/context/connections/:id/extraction` | `context.manage` (demo mode only) |
 | `GET` | `/api/context/connections/:id/extraction` | `context.read` |
 | `GET` | `/api/context/connections/:id/context-objects` | `context.read` |
+| `GET` | `/api/context/connections/:id/understanding` | `context.read` (glossary for step 4) |
 
 Model, Review and Publish routes (`/model`, `/review…`, `/publish…`) are in `routes.js`.
 
@@ -248,7 +249,10 @@ pending review). Two tables selected, two tables of facts.
 
 It upserts in one statement, keeps a human's `verified` decision on re-run, and removes
 only rows an earlier *demo* run wrote. The report is stored on the draft
-(`extraction_report`) and returned with `mode: 'demo'` so the UI labels it.
+(`extraction_report`). The UI presents the run like any other (no "demo" wording, by
+request); provenance is `extraction_mode = 'demo'` on the version row and `mode: 'demo'`
+on the `context_extraction_run` audit event. Session ids are plain UUIDs; earlier demo
+sessions are recognised through the version rows for cleanup.
 
 The frontend reads the mode from `GET /settings`, so **flipping the env var back to
 `agent` is the whole switch**; `demoExtraction.js`, `extractionMode.js` and the two

@@ -124,6 +124,30 @@ async function selectedDatasets(connectionId) {
   return rows.map(shapeSelected);
 }
 
+/**
+ * The connection's id, if the caller may see it - or the same 404 loadRow
+ * gives. For the routes that only need to know the connection is theirs before
+ * reading its facts: one query, no sealed secret selected, no dataset list.
+ */
+async function requireConnectionId(actor, id) {
+  if (typeof id !== 'string' || !id.trim()) {
+    throw fail('RESOURCE_NOT_FOUND', 'Connection not found');
+  }
+  const scope = companyScope(actor, 'c.company_id');
+  let rows;
+  try {
+    ({ rows } = await db.query(
+      `SELECT c.id FROM ${CT.connections} c WHERE c.id = ? AND ${scope.clause}`,
+      [id, ...scope.params]
+    ));
+  } catch (err) {
+    if (err.code === '22P02') throw fail('RESOURCE_NOT_FOUND', 'Connection not found');
+    throw err;
+  }
+  if (!rows[0]) throw fail('RESOURCE_NOT_FOUND', 'Connection not found');
+  return { id: rows[0].id };
+}
+
 /** One connection as the caller may see it, with its chosen datasets. */
 async function requireConnection(actor, id) {
   const row = await loadRow(actor, id);
@@ -421,6 +445,7 @@ async function deleteConnection(actor, id) {
 module.exports = {
   listConnections,
   requireConnection,
+  requireConnectionId,
   createConnection,
   fetchDatasets,
   profileOverview,

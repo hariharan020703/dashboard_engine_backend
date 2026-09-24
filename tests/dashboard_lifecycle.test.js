@@ -164,9 +164,12 @@ async function runTests() {
   const adminLevel = await access.getAccessLevel(mockCompanyAdmin, dashA_Id);
   const userLevel = await access.getAccessLevel(mockCompanyUser, dashA_Id);
   assert(adminLevel === 'admin', 'Company Admin must have admin level');
-  assert(userLevel === 'developer' || userLevel === 'admin', 'Company User must have at least developer level to edit cards');
+  // A USER's level comes from their grant alone. Holding dashboard.update in
+  // the role says they may edit dashboards in general, not this one: with no
+  // grant on it they have no access at all (they used to be given "developer").
+  assert(userLevel === null, 'Company User with no grant must have no access to the dashboard');
   console.log(`  ✓ Company Admin level: ${adminLevel}`);
-  console.log(`  ✓ Company User level: ${userLevel} (allows card edit)`);
+  console.log('  ✓ Company User without a grant: no access (edit needs a "developer" grant)');
 
   // 7. Test Deletion & Cascade
   console.log('\n[7] Testing Dashboard Deletion:');

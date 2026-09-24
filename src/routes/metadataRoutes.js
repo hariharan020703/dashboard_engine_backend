@@ -86,7 +86,7 @@ router.get(
 router.post(
   '/preview',
   requirePermission('dashboard.update'),
-  requireDashboardAccess('view'),
+  requireDashboardAccess('developer'),
   async (req, res) => {
     const { card, filters } = req.body || {};
     if (!card || typeof card !== 'object') throw fail('VALIDATION_ERROR', 'Expected { card }');

@@ -25,6 +25,8 @@ const { EXTRACTION_MODE } = require('./extractionMode');
  * company from the actor rather than from the request, and the service filters
  * by it in SQL.
  */
+const { mcpDetails } = require('./mcpAccess');
+
 const router = express.Router();
 
 router.use(requireRbac, requireAuth, requirePasswordCurrent);
@@ -96,9 +98,36 @@ router.get('/settings', requirePermission('context.read'), (req, res) => {
 // GET /api/context/connections - this company's saved connections
 router.get('/connections', requirePermission('context.read'), async (req, res) => {
   const list = await connections.listConnections(req.actor);
-  // Each card says whether its context is a draft or published, and which version.
+  // `context` is the version the builder works on (the open draft, else the
+  // latest published); `published` is what is live. A connection being edited
+  // has both - it is still serving the published version meanwhile.
   const status = await versions.statusByConnection(list.map((c) => c.id));
-  ok(res, list.map((c) => ({ ...c, context: status.get(c.id) || null })));
+  ok(res, list.map((c) => {
+    const s = status.get(c.id) || { draft: null, published: null };
+    return { ...c, context: s.draft || s.published, published: s.published };
+  }));
+});
+
+/*
+ * GET /api/context/connections/:id/mcp - how an MCP client reaches this
+ * connection's PUBLISHED context: server URL, transport, auth header, the
+ * workspace id every tool call carries, the tools, and a paste-ready client
+ * config. The shared reader token is never included - see mcpAccess.js.
+ *
+ * 404 until something has been published: an unpublished context is not what
+ * an external client should be pointed at.
+ */
+router.get('/connections/:id/mcp', requirePermission('context.read'), async (req, res) => {
+  const connection = await connections.requireConnection(req.actor, req.params.id);
+  const published = await versions.latestPublished(connection.id);
+  if (!published) {
+    throw fail('RESOURCE_NOT_FOUND', 'This connection has no published context yet.');
+  }
+  ok(res, mcpDetails(connection, {
+    name: published.name,
+    label: `v${published.version}`,
+    publishedAt: published.published_at || published.publishedAt || null,
+  }));
 });
 
 /**
@@ -266,14 +295,20 @@ router.post('/connections/:id/extraction', requirePermission('context.manage'), 
 
 // GET .../extraction - the latest stored extraction report, or null.
 router.get('/connections/:id/extraction', requirePermission('context.read'), async (req, res) => {
-  const connection = await connections.requireConnection(req.actor, req.params.id);
+  const connection = await connections.requireConnectionId(req.actor, req.params.id);
   ok(res, await demo.latestExtraction(connection.id));
+});
+
+// GET .../understanding - the business glossary and its counts, for step 4.
+router.get('/connections/:id/understanding', requirePermission('context.read'), async (req, res) => {
+  const connection = await connections.requireConnectionId(req.actor, req.params.id);
+  ok(res, await contextStore.understanding(connection.id, req.query));
 });
 
 // GET .../context-objects - the latest run's facts, in the ADK API's shape.
 router.get('/connections/:id/context-objects', requirePermission('context.read'), async (req, res) => {
-  const connection = await connections.requireConnection(req.actor, req.params.id);
-  ok(res, await contextStore.listContextObjects(connection.id));
+  const connection = await connections.requireConnectionId(req.actor, req.params.id);
+  ok(res, await contextStore.listContextObjects(connection.id, req.query));
 });
 
 /* ------------------------------------------------- steps 5, 6 and 7 --- */
@@ -293,13 +328,13 @@ async function connectionFor(req) {
 
 // GET /api/context/connections/:id/model - the relationship graph.
 router.get('/connections/:id/model', requirePermission('context.read'), async (req, res) => {
-  const connection = await connectionFor(req);
+  const connection = await connections.requireConnectionId(req.actor, req.params.id);
   ok(res, await contextStore.modelGraph(connection.id));
 });
 
 // GET /api/context/connections/:id/review - the review queue.
 router.get('/connections/:id/review', requirePermission('context.read'), async (req, res) => {
-  const connection = await connectionFor(req);
+  const connection = await connections.requireConnectionId(req.actor, req.params.id);
   ok(res, await contextStore.reviewQueue(connection.id, req.query));
 });
 

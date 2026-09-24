@@ -110,8 +110,23 @@ function fail(code, message, details) {
   return new ApiError(code, message, details);
 }
 
+/**
+ * Serialised here rather than through res.json() so the cost of producing the
+ * body can be reported separately from the work before it. Both land in a
+ * Server-Timing header, which the browser's Network panel shows per request
+ * ("Timing" tab): `app` is time since the request entered the API router
+ * (auth, queries, shaping), `ser` is JSON serialisation alone.
+ */
 function ok(res, data, status = 200) {
-  return res.status(status).json({ success: true, data });
+  const serStart = process.hrtime.bigint();
+  const body = JSON.stringify({ success: true, data });
+  const serMs = Number(process.hrtime.bigint() - serStart) / 1e6;
+
+  const timings = [`ser;dur=${serMs.toFixed(2)}`];
+  if (res.locals.start) timings.unshift(`app;dur=${Date.now() - res.locals.start}`);
+  res.set('Server-Timing', timings.join(', '));
+
+  return res.status(status).type('application/json').send(body);
 }
 
 /** Writes the error response for `err`, logging anything that is not a client fault. */

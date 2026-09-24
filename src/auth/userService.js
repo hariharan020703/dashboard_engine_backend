@@ -3,6 +3,7 @@ const { db, T } = require('../config/database');
 const { UNIQUE_VIOLATION } = require('../config/pgPool');
 const { BCRYPT_ROUNDS, MIN_PASSWORD_LENGTH } = require('../config/auth');
 const { fail } = require('../api/response');
+const { likePattern, orderBy, pagedRows } = require('../api/listQuery');
 const {
   ROLE_SCOPES,
   PERMISSION_IDS,
@@ -30,8 +31,17 @@ const USERNAME_RE = /^[a-zA-Z0-9._-]{2,50}$/;
 // activation mail arriving, not a regular expression.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
+/*
+ * The account columns every read uses. The bcrypt hash is deliberately not
+ * among them: only the two paths that verify a password select it
+ * (findUserByIdentifier for sign-in, findCredentialsById for a change), so a
+ * user list or a per-request actor read never carries a hash out of the
+ * database. `has_password` answers "is this account activated" for the one
+ * caller that needs to know, without the hash itself.
+ */
 const USER_COLUMNS = `u.id, u.company_id, u.username, u.email, u.display_name,
-                      u.password_hash, u.role, u.status, u.must_change_password,
+                      (u.password_hash IS NOT NULL) AS has_password,
+                      u.role, u.status, u.must_change_password,
                       u.last_login_at, u.created_at`;
 
 /** Shape safe to hand to a browser: no hash, no token state. */
@@ -64,13 +74,52 @@ async function findUserByIdentifier(identifier) {
   const value = String(identifier || '').trim();
   if (!value) return null;
   const { rows } = await db.query(
-    `SELECT ${USER_COLUMNS}, c.active AS "companyActive", c.name AS "companyName"
+    `SELECT ${USER_COLUMNS}, u.password_hash,
+            c.active AS "companyActive", c.name AS "companyName"
        FROM ${T.users} u
        LEFT JOIN ${T.companies} c ON c.id = u.company_id
       WHERE u.username = ? OR u.email = ?`,
     [value, value.toLowerCase()]
   );
   return rows[0] || null;
+}
+
+/** Just the stored hash, for verifying a password change. */
+async function findCredentialsById(id) {
+  const { rows } = await db.query(`SELECT password_hash FROM ${T.users} WHERE id = ?`, [id]);
+  return rows[0] || null;
+}
+
+/**
+ * Everything requireAuth needs about the caller, in ONE round trip: the account,
+ * its company's status, its role's permissions and its data scopes.
+ *
+ * This runs on every authenticated request, so its cost is paid by every
+ * screen. As three sequential queries it was three network round trips before
+ * a handler could start - against a managed database ~260 ms away, most of a
+ * second of every response. Subselects keep it one statement.
+ *
+ * `permissions` is the raw role_permissions list; SUPER_ADMIN and retired ids
+ * are resolved by rolePermissionList() exactly as getRolePermissions does.
+ */
+async function findActorRow(id) {
+  const { rows } = await db.query(
+    `SELECT ${USER_COLUMNS}, c.active AS "companyActive", c.name AS "companyName",
+            COALESCE((SELECT array_agg(rp.permission_id) FROM ${T.rolePermissions} rp
+                       WHERE rp.role_name = u.role), '{}') AS permissions,
+            COALESCE((SELECT json_agg(json_build_array(s.dimension, s.value)
+                                      ORDER BY s.dimension, s.value)
+                        FROM ${T.userDataScope} s WHERE s.user_id = u.id), '[]') AS scopes
+       FROM ${T.users} u
+       LEFT JOIN ${T.companies} c ON c.id = u.company_id
+      WHERE u.id = ?`,
+    [id]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  const scopes = {};
+  for (const [dimension, value] of row.scopes) (scopes[dimension] = scopes[dimension] || []).push(value);
+  return { user: row, permissions: rolePermissionList(row.role, row.permissions), scopes };
 }
 
 /** The account with this id, ignoring the company boundary. Middleware only. */
@@ -113,36 +162,96 @@ async function requireUserInScope(actor, id) {
   return user;
 }
 
+/*
+ * Sort keys the people table offers, mapped to the SQL that orders by them.
+ * `name` is what the Name column shows: the display name, else the username.
+ */
+const USER_SORTS = {
+  name: 'lower(COALESCE(u.display_name, u.username))',
+  company: 'lower(c.name)',
+  role: 'u.role',
+  status: 'u.status',
+  lastLogin: 'u.last_login_at',
+};
+
+const USER_STATUSES = ['active', 'pending', 'disabled'];
+
 /**
- * The user directory the caller may see.
+ * One row of the people table - the columns it renders and nothing else.
+ *
+ * Optional fields are omitted when empty rather than sent as null: no display
+ * name, never signed in, or (platform view) no company because it is a
+ * platform account. `companyName` is only ever sent to a platform caller; a
+ * company caller's list is one company by definition.
+ */
+function userListItem(row, withCompany) {
+  const item = { id: row.id, username: row.username, email: row.email, role: row.role, status: row.status };
+  if (row.display_name) item.displayName = row.display_name;
+  if (row.last_login_at) item.lastLoginAt = row.last_login_at;
+  if (withCompany && row.companyName) item.companyName = row.companyName;
+  return item;
+}
+
+/**
+ * One page of the user directory the caller may see, searched, filtered and
+ * sorted in SQL.
  *
  * A platform caller sees everyone and may narrow with `companyId`; a company
  * caller sees their own company and cannot widen, because the filter is applied
  * to their own id rather than to anything from the request.
+ *
+ * @param list     parseListQuery() output
+ * @param filters  { companyId, role, status }
  */
-async function listUsers(actor, { companyId } = {}) {
+async function listUsers(actor, list, { companyId, role, status } = {}) {
   const where = [];
   const params = [];
 
   if (actor.isPlatform) {
     if (companyId !== undefined && companyId !== null && companyId !== '') {
+      const id = Number(companyId);
+      if (!Number.isInteger(id) || id < 1) throw fail('VALIDATION_ERROR', 'companyId must be a positive integer.');
       where.push('u.company_id = ?');
-      params.push(Number(companyId));
+      params.push(id);
     }
   } else {
     where.push('u.company_id = ?');
     params.push(actor.companyId);
   }
+  if (role) {
+    if (!ROLE_SCOPE_BY_NAME.has(String(role))) throw fail('VALIDATION_ERROR', `Unknown role: "${role}"`);
+    where.push('u.role = ?');
+    params.push(String(role));
+  }
+  if (status) {
+    if (!USER_STATUSES.includes(String(status))) {
+      throw fail('VALIDATION_ERROR', `status must be one of: ${USER_STATUSES.join(', ')}.`);
+    }
+    where.push('u.status = ?');
+    params.push(String(status));
+  }
+  if (list.search) {
+    where.push(`(u.username ILIKE ? OR u.email ILIKE ? OR u.display_name ILIKE ?)`);
+    const pattern = likePattern(list.search);
+    params.push(pattern, pattern, pattern);
+  }
 
-  const { rows } = await db.query(
-    `SELECT ${USER_COLUMNS}, c.name AS "companyName"
-       FROM ${T.users} u
+  const from = `FROM ${T.users} u
        LEFT JOIN ${T.companies} c ON c.id = u.company_id
-      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-      ORDER BY c.name NULLS FIRST, u.username`,
-    params
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}`;
+
+  return pagedRows(
+    db,
+    `SELECT u.id, u.username, u.email, u.display_name, u.role, u.status, u.last_login_at,
+            c.name AS "companyName", COUNT(*) OVER () AS "__total"
+       ${from}
+      ${orderBy(list, USER_SORTS, 'u.id')}
+      LIMIT ? OFFSET ?`,
+    [...params, list.pageSize, list.offset],
+    `SELECT COUNT(*) AS n ${from}`,
+    params,
+    (row) => userListItem(row, actor.isPlatform)
   );
-  return rows.map(publicUser);
 }
 
 /** id, username and email for the pickers, never crossing the company line. */
@@ -174,9 +283,17 @@ async function getRolePermissions(roleName) {
     `SELECT permission_id FROM ${T.rolePermissions} WHERE role_name = ?`,
     [roleName]
   );
-  // A permission that has since been retired from the catalogue is dropped
-  // here rather than handed to `can`, which would throw on it.
-  return rows.map((r) => r.permission_id).filter((id) => PERMISSION_IDS.includes(id));
+  return rolePermissionList(roleName, rows.map((r) => r.permission_id));
+}
+
+/**
+ * The effective list for a role, from its stored ids. SUPER_ADMIN is answered
+ * from the catalogue; a permission since retired from the catalogue is dropped
+ * here rather than handed to `can`, which would throw on it.
+ */
+function rolePermissionList(roleName, storedIds) {
+  if (roleName === SUPER_ADMIN) return [...PERMISSION_IDS];
+  return (storedIds || []).filter((id) => PERMISSION_IDS.includes(id));
 }
 
 /** The role row for a name, or null. Role names are case-sensitive constants. */
@@ -341,9 +458,12 @@ module.exports = {
   publicUser,
   findUserByIdentifier,
   findUserById,
+  findActorRow,
+  findCredentialsById,
   findUserInScope,
   requireUserInScope,
   listUsers,
+  USER_SORTS,
   listUserOptions,
   getRolePermissions,
   findRole,

@@ -27,8 +27,11 @@ const versions = require('./versionService');
  *   example queries are generated from templates over those facts, and joins
  *   are guessed from matching column names. So everything interpretive is
  *   written `verified = false`, `source_type = 'db_inferred'` - pending human
- *   review, exactly as the skill requires of the agent - and the report says
- *   plainly that no AI was involved.
+ *   review, exactly as the skill requires of the agent.
+ *
+ *   The screen presents it like any extraction run (product decision). Where
+ *   it came from is recorded server-side instead: `extraction_mode = 'demo'`
+ *   on the version row, and `mode: 'demo'` on the audit event.
  *
  * It writes the SAME rows the agent does - `context_objects`, tagged with a
  * session id, payloads shaped per the skill's `payload-schemas.md` - which is
@@ -62,6 +65,12 @@ function humanize(value) {
     .replace(/[_\-.]+/g, ' ')
     .trim()
     .toLowerCase();
+}
+
+/** `sales order` → `Sales order`. The glossary's display name. */
+function title(words) {
+  const text = String(words || '').trim();
+  return text ? text[0].toUpperCase() + text.slice(1) : text;
 }
 
 /** A rough singular for prose - "orders" reads as "each order". */
@@ -346,9 +355,10 @@ function buildObjects(tables, joins) {
         ...(table.rowCount !== null && table.rowCount !== undefined ? { row_count: `≈ ${formatCount(table.rowCount)}` } : {}),
         ...(table.lastRefreshedAt ? { freshness: `last refreshed ${table.lastRefreshedAt}` } : {}),
         description: tableDescription(table),
-        demo: true,
+        term: title(table.entity),
       },
-      { verified: table.profiled, sourceType: 'bi_verified' }
+      // Read straight from the source: as certain as this run gets.
+      { verified: table.profiled, sourceType: 'bi_verified', confidence: table.profiled ? 0.95 : 0.4 }
     );
 
     // Nothing was read for an unprofiled table, so nothing is derived from it.
@@ -375,31 +385,50 @@ function buildObjects(tables, joins) {
           ...(column.max !== null && column.max !== undefined ? { max: column.max } : {}),
           ...(notes.length ? { note: notes.join('; ') } : {}),
           description: columnDescription(table, column),
-          demo: true,
         },
         { verified: true, sourceType: 'bi_verified' }
       );
     }
 
     // Metrics: a count, and totals over the first few numeric measures.
-    push('metric', `${table.name}_count`, {
-      formula: `COUNT(*) FROM ${table.name}`,
-      underlying_table: table.name,
-      synonyms: `number of ${humanize(table.name)}, ${table.entity} count`,
-      owner: 'unassigned',
-      description: `How many ${humanize(table.name)} there are.`,
-      demo: true,
-    });
+    push(
+      'metric',
+      `${table.name}_count`,
+      {
+        term: title(`${table.entity} count`),
+        formula: `COUNT(*) FROM ${table.name}`,
+        underlying_table: table.name,
+        synonyms: `number of ${humanize(table.name)}, ${table.entity} count`,
+        owner: 'unassigned',
+        description: `Number of ${humanize(table.name)} records.`,
+      },
+      // A row count needs no interpretation.
+      { confidence: 0.97 }
+    );
     const measures = table.columns.filter((c) => c.kind === 'number').slice(0, MAX_METRIC_COLUMNS);
     for (const measure of measures) {
-      push('metric', `${table.name}_total_${slug(measure.name)}`, {
-        formula: `SUM(${table.name}.${measure.name})`,
-        underlying_table: table.name,
-        synonyms: `total ${humanize(measure.name)}, sum of ${humanize(measure.name)}`,
-        owner: 'unassigned',
-        description: `Total ${humanize(measure.name)} across ${humanize(table.name)}.`,
-        demo: true,
-      });
+      push(
+        'metric',
+        `${table.name}_total_${slug(measure.name)}`,
+        {
+          term: title(`total ${humanize(measure.name)}`),
+          formula: `SUM(${table.name}.${measure.name})`,
+          underlying_table: table.name,
+          synonyms: `total ${humanize(measure.name)}, sum of ${humanize(measure.name)}`,
+          owner: 'unassigned',
+          description: `Sum of ${humanize(measure.name)} across all ${humanize(table.name)}.`,
+        },
+        /*
+         * Summing is right for amounts and quantities, wrong for rates and
+         * prices-per-unit; the name is the only evidence, so a measure that
+         * reads like an amount scores higher than one that does not.
+         */
+        {
+          confidence: /(amount|revenue|sales|total|cost|qty|quantity|units|value|price)/i.test(measure.name)
+            ? 0.88
+            : 0.72,
+        }
+      );
     }
 
     // Glossary: low-cardinality text columns, whose values need defining.
@@ -407,13 +436,23 @@ function buildObjects(tables, joins) {
       (c) => c.kind === 'text' && c.uniqueCount !== null && c.uniqueCount >= 2 && c.uniqueCount <= 12 && c.values.length
     );
     for (const category of categories.slice(0, 3)) {
-      push('glossary', `${humanize(category.name)} (${table.name})`, {
-        definition: `The ${humanize(category.name)} of a ${table.entity}; one of: ${category.values.join(', ')}.`,
-        synonyms: humanize(category.name),
-        owner: 'unassigned',
-        note: 'Values taken from the sample - confirm the full list and what each means.',
-        demo: true,
-      });
+      const definition = `The ${humanize(category.name)} of a ${table.entity}; one of ${category.values.join(', ')}.`;
+      push(
+        'glossary',
+        `${humanize(category.name)} (${table.name})`,
+        {
+          term: title(humanize(category.name)),
+          kind: 'dimension',
+          applies_to: table.name,
+          definition,
+          description: definition,
+          synonyms: humanize(category.name),
+          owner: 'unassigned',
+          note: 'Values taken from the sample - confirm the full list and what each means.',
+        },
+        // Every value seen is listed when there are few; more values, less certainty.
+        { confidence: category.uniqueCount <= 5 ? 0.86 : 0.74 }
+      );
     }
 
     // Example: an aggregate over the first category and measure, else a preview.
@@ -433,7 +472,6 @@ function buildObjects(tables, joins) {
         dim && measure
           ? `Top ${humanize(dim.name)} values by total ${humanize(measure.name)}.`
           : `A first look at ${humanize(table.name)}.`,
-      demo: true,
     });
   }
 
@@ -447,7 +485,6 @@ function buildObjects(tables, joins) {
         cardinality: join.cardinality,
         confidence: join.confidence,
         basis: join.basis,
-        demo: true,
       },
       { confidence: join.confidence }
     );
@@ -457,7 +494,6 @@ function buildObjects(tables, joins) {
       used_in_dashboards: 'none yet - generated example',
       usage_count_30d: 0,
       description: `${humanize(join.left.name)} joined to ${humanize(join.right.name)} on ${join.leftColumn}.`,
-      demo: true,
     });
   }
 
@@ -471,8 +507,6 @@ function buildReport(tables, joins, objects) {
   const failed = tables.filter((t) => !t.profiled);
 
   const lines = [
-    '> **Demo output.** Generated from the selected tables\' real schema and sample statistics, without calling the AI agent. Descriptions, metrics, glossary terms and joins are templated guesses - review them before publishing.',
-    '',
     '## Summary',
     '',
     `Profiled **${tables.length - failed.length} of ${tables.length}** selected table${tables.length === 1 ? '' : 's'} and wrote **${objects.length}** facts to the context layer.`,
@@ -518,7 +552,7 @@ function buildReport(tables, joins, objects) {
     '## Next steps',
     '',
     '1. **Model** — check the inferred relationships.',
-    '2. **Review** — table and column facts are pre-approved (read from the source); approve or edit the metrics, glossary terms, joins and examples.',
+    '2. **Review** — table and column facts are verified against the source; approve or edit the metrics, glossary terms, relationships and examples, starting with the lowest confidence.',
     '3. **Publish** — only approved facts are included.'
   );
   return lines.join('\n');
@@ -535,20 +569,28 @@ function buildReport(tables, joins, objects) {
  *
  * On conflict - the same qualified name from an earlier run - the payload and
  * session are replaced but a HUMAN decision is kept: a row somebody has
- * reviewed keeps its `verified`, so re-running the demo does not undo Review.
+ * reviewed keeps its `verified`, and a row somebody EDITED keeps its payload,
+ * so re-running the demo does not undo Review.
  *
  * Rows an earlier DEMO run wrote that this one did not are removed, so the
  * run fully replaces the previous demo instead of leaving orphans from a
- * deselected table. Rows the real agent wrote are never touched.
+ * deselected table. Rows the real agent wrote are never touched: a demo run's
+ * session is recognised by the version rows that recorded it as
+ * `extraction_mode = 'demo'` (and, for runs from before that, by the old
+ * `demo-` session prefix).
  */
 async function writeObjects(connectionId, sessionId, objects) {
   await withTransaction(async (conn) => {
     await conn.query(
       `DELETE FROM ${OBJECTS}
         WHERE workspace_id = ?::uuid
-          AND session_id LIKE 'demo-%'
+          AND (session_id LIKE 'demo-%'
+               OR session_id IN (SELECT v.session_id FROM ${quoteIdentifier('context_layer_versions')} v
+                                  WHERE v.connection_id = ?::uuid
+                                    AND v.extraction_mode = 'demo'
+                                    AND v.session_id IS NOT NULL))
           AND NOT (qualified_name = ANY(?::text[]))`,
-      [connectionId, objects.map((o) => o.qualified_name)]
+      [connectionId, connectionId, objects.map((o) => o.qualified_name)]
     );
 
     await conn.query(
@@ -565,7 +607,10 @@ async function writeObjects(connectionId, sessionId, objects) {
          object_type = EXCLUDED.object_type,
          source_type = EXCLUDED.source_type,
          confidence  = EXCLUDED.confidence,
-         payload     = EXCLUDED.payload,
+         payload     = CASE WHEN EXISTS (
+                         SELECT 1 FROM ${quoteIdentifier('context_object_reviews')} rv
+                          WHERE rv.object_id = ${OBJECTS}.id AND rv.edited)
+                       THEN ${OBJECTS}.payload ELSE EXCLUDED.payload END,
          verified    = CASE WHEN ${OBJECTS}.reviewed_at IS NOT NULL
                             THEN ${OBJECTS}.verified ELSE EXCLUDED.verified END,
          updated_at  = now()`,
@@ -610,7 +655,7 @@ async function runDemoExtraction(actor, connection) {
   const joins = inferJoins(tables.filter((t) => t.profiled));
   const objects = buildObjects(tables, joins);
   const report = buildReport(tables, joins, objects);
-  const sessionId = `demo-${crypto.randomUUID()}`;
+  const sessionId = crypto.randomUUID();
 
   try {
     await writeObjects(connection.id, sessionId, objects);

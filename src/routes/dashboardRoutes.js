@@ -60,8 +60,7 @@ router.post('/', requirePermission('dashboard.create'), async (req, res) => {
   registry.assertValidDashboardId(id);
 
   // Check if ID already exists
-  const existing = (await registry.listDashboards()).find((d) => d.id === id);
-  if (existing) {
+  if (await registry.dashboardExists(id)) {
     throw fail('CONFLICT', `A dashboard with id "${id}" already exists.`);
   }
 
@@ -150,7 +149,9 @@ router.get(
 router.patch(
   '/:dashboardId/config',
   requirePermission('dashboard.update'),
-  requireDashboardAccess('view'),
+  // Changing cards is "Can edit" (developer) and above - a viewer's role may
+  // include dashboard.update, but their grant on THIS dashboard does not.
+  requireDashboardAccess('developer'),
   async (req, res) => {
     const { index, card, filters } = req.body || {};
     if (!card || typeof index !== 'number') {
@@ -192,6 +193,8 @@ router.patch(
 router.delete(
   '/:dashboardId',
   requirePermission('dashboard.delete'),
+  // Deleting is full control of the dashboard.
+  requireDashboardAccess('admin'),
   async (req, res) => {
     const id = req.params.dashboardId;
     const spec = await getSpec(id);

@@ -60,7 +60,9 @@ router.use(requireRbac, requireAuth, requirePasswordCurrent, requirePlatform);
  * pairs exist, which is the number that changes as customers are onboarded.
  */
 router.get('/overview', requirePermission('company.read'), async (req, res) => {
-  const { rows } = await db.query(
+  // The counts and the registry size are independent, so they are read
+  // concurrently: one round trip of latency rather than two.
+  const [{ rows }, dashboards] = await Promise.all([db.query(
     `SELECT
        (SELECT COUNT(*) FROM ${T.companies})                                  AS "companies",
        (SELECT COUNT(*) FROM ${T.companies} WHERE active)                     AS "companiesActive",
@@ -72,7 +74,7 @@ router.get('/overview', requirePermission('company.read'), async (req, res) => {
        (SELECT COUNT(*) FROM ${T.users} WHERE role = 'COMPANY_ADMIN')         AS "companyAdmins",
        (SELECT COUNT(*) FROM ${T.groups})                                     AS "groups",
        (SELECT COUNT(*) FROM ${T.companyDashboards})                          AS "assignments"`
-  );
+  ), registry.countDashboards()]);
 
   const counts = rows[0];
   const numeric = Object.fromEntries(
@@ -82,7 +84,7 @@ router.get('/overview', requirePermission('company.read'), async (req, res) => {
   ok(res, {
     ...numeric,
     companiesInactive: numeric.companies - numeric.companiesActive,
-    dashboards: (await registry.listDashboards()).length,
+    dashboards,
   });
 });
 
@@ -119,7 +121,7 @@ router.get('/settings', async (req, res) => {
     },
     engine: {
       queryConcurrency: QUERY_CONCURRENCY,
-      dashboardCount: (await registry.listDashboards()).length,
+      dashboardCount: await registry.countDashboards(),
     },
     email: describeTransport(),
   });

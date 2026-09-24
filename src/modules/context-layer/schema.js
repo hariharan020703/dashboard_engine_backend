@@ -216,6 +216,9 @@ const TABLES = [
 ];
 
 const INDEXES = [
+  // A person edited what the run wrote: "Human override" in Understand, and
+  // kept as-is when the demo extraction is re-run.
+  `ALTER TABLE ${CT.reviews} ADD COLUMN IF NOT EXISTS edited BOOLEAN NOT NULL DEFAULT FALSE`,
   `CREATE INDEX IF NOT EXISTS idx_context_connections_company ON ${CT.connections} (company_id)`,
   `CREATE INDEX IF NOT EXISTS idx_context_object_reviews_connection
      ON ${CT.reviews} (connection_id)`,

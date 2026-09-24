@@ -1,6 +1,6 @@
 const { withTransaction } = require('../../config/database');
 const { fail, requireString } = require('../../api/response');
-const { loadObjects, reviewStatusOf } = require('./contextStore');
+const { loadObjects, reviewStatusOf, columnSplitter } = require('./contextStore');
 const versions = require('./versionService');
 
 /**
@@ -42,18 +42,24 @@ function countByType(rows) {
 /**
  * The tables a set of facts covers.
  *
- * Derived from `table` rows where there are any, and from the prefix of
+ * Derived from `table` rows where there are any, and from the table part of
  * `column_stats` names otherwise - a run can record columns for a table it did
  * not write a `table` row for, and the count should say what is actually
  * covered rather than what happens to have one row type.
+ *
+ * `allRows` is the whole run, not just the approved facts: it supplies the
+ * known table names that `columnSplitter` matches against, so a column whose
+ * own name contains dots is still attributed to its real table even when that
+ * table's row is not approved yet.
  */
-function tablesCovered(rows) {
+function tablesCovered(rows, allRows = rows) {
+  const split = columnSplitter(allRows);
   const names = new Set();
   for (const row of rows) {
     if (row.object_type === 'table') names.add(row.qualified_name);
     else if (row.object_type === 'column_stats') {
-      const dot = row.qualified_name.lastIndexOf('.');
-      if (dot > 0) names.add(row.qualified_name.slice(0, dot));
+      const { table } = split(row.qualified_name);
+      if (table) names.add(table);
     }
   }
   return [...names];
@@ -72,7 +78,7 @@ async function publishSummary(actor, connection) {
   const approved = publishable(rows);
   const pending = rows.filter((row) => reviewStatusOf(row) === 'pending');
   const counts = countByType(approved);
-  const tables = tablesCovered(approved);
+  const tables = tablesCovered(approved, rows);
 
   const stats = [
     { id: 'datasets', label: 'Datasets', value: (connection.selectedDatasets || []).length },
@@ -212,7 +218,7 @@ async function publishContext(actor, connection, { name, notifyTeam = false } = 
     versions.publishDraft(conn, actor, connection, {
       name: cleanName,
       snapshot,
-      stats: { counts, tables: tablesCovered(approved) },
+      stats: { counts, tables: tablesCovered(approved, rows) },
       sessionId: approved[0].session_id || null,
       notifyTeam,
     })

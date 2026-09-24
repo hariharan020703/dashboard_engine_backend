@@ -308,33 +308,43 @@ async function latestExtraction(connectionId) {
   return rows[0] || null;
 }
 
+function headline(row) {
+  return {
+    name: row.name,
+    version: Number(row.version),
+    label: `v${row.version}`,
+    status: row.status,
+    publishedAt: row.published_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 /**
- * The context headline for each connection in a list, keyed by connection id -
- * one query for the whole landing page rather than one per card.
+ * For each connection in a list: its open draft and its latest published
+ * version, each or both possibly absent - one query for the whole landing
+ * page rather than one per card.
+ *
+ * Both, not "whichever is newer": the landing page lists work in progress and
+ * what is live separately, and a connection being edited (draft v2) is still
+ * serving v1 in the meantime.
  */
 async function statusByConnection(connectionIds) {
   if (!connectionIds.length) return new Map();
   const { rows } = await db.query(
-    `SELECT DISTINCT ON (connection_id)
+    `SELECT DISTINCT ON (connection_id, status)
             connection_id, name, version, status, published_at, updated_at
        FROM ${CT.versions}
       WHERE connection_id = ANY(?::uuid[])
-      ORDER BY connection_id, (status = 'draft') DESC, updated_at DESC`,
+      ORDER BY connection_id, status, COALESCE(published_at, updated_at) DESC`,
     [connectionIds]
   );
-  return new Map(
-    rows.map((row) => [
-      row.connection_id,
-      {
-        name: row.name,
-        version: Number(row.version),
-        label: `v${row.version}`,
-        status: row.status,
-        publishedAt: row.published_at,
-        updatedAt: row.updated_at,
-      },
-    ])
-  );
+  const byConnection = new Map();
+  for (const row of rows) {
+    const entry = byConnection.get(row.connection_id) || { draft: null, published: null };
+    entry[row.status === 'draft' ? 'draft' : 'published'] = headline(row);
+    byConnection.set(row.connection_id, entry);
+  }
+  return byConnection;
 }
 
 module.exports = {

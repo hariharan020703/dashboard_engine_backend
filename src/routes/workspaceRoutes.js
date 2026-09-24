@@ -53,7 +53,7 @@ function tenantId(actor) {
  * they actually have.
  */
 router.get('/company', requirePermission('company.read'), async (req, res) => {
-  ok(res, await companies.requireCompany(req.actor, tenantId(req.actor)));
+  ok(res, await companies.requireCompany(req.actor, tenantId(req.actor), { counts: true }));
 });
 
 /**
@@ -71,7 +71,10 @@ router.get('/company', requirePermission('company.read'), async (req, res) => {
 router.get('/overview', async (req, res) => {
   const companyId = tenantId(req.actor);
 
-  const { rows } = await db.query(
+  // Counts and the caller's own dashboard count are independent reads, run
+  // concurrently. The dashboard count is COUNTed in SQL rather than by building
+  // the whole accessible list to take its length.
+  const [{ rows }, dashboardsGranted] = await Promise.all([db.query(
     `SELECT
        (SELECT COUNT(*) FROM ${T.users}  WHERE company_id = ?)                  AS "users",
        (SELECT COUNT(*) FROM ${T.users}  WHERE company_id = ? AND status = 'active')  AS "usersActive",
@@ -80,19 +83,15 @@ router.get('/overview', async (req, res) => {
        (SELECT COUNT(*) FROM ${T.groups} WHERE company_id = ? AND active)       AS "groupsActive",
        (SELECT COUNT(*) FROM ${T.companyDashboards} WHERE company_id = ?)       AS "dashboards"`,
     [companyId, companyId, companyId, companyId, companyId, companyId]
-  );
+  ), access.countAccessibleDashboards(req.actor)]);
 
   const numeric = Object.fromEntries(
     Object.entries(rows[0]).map(([key, value]) => [key, Number(value)])
   );
 
-  const granted = await access.listAccessibleDashboards(req.actor);
-
-  ok(res, {
-    ...numeric,
-    dashboardsGranted: granted.length,
-    company: await companies.requireCompany(req.actor, companyId),
-  });
+  // The company record is not repeated here: the overview screen shows the
+  // counts, and the company is read by the screens that display it.
+  ok(res, { ...numeric, dashboardsGranted });
 });
 
 module.exports = router;
